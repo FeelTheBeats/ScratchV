@@ -289,7 +289,7 @@ def verify_assembly(asm_code: str, verbose: bool = False) -> dict:
         }
 
     lines = asm_code.strip().split("\n")
-    load_asm(lines, origin=0)
+    m.load_asm(lines, origin=0)
 
     try:
         m.run(instructions=100_000_000)
