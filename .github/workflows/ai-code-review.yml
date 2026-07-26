@@ -41,34 +41,59 @@ jobs:
           # ── Inline system prompt ──
           SYSTEM_PROMPT=$(cat .github/prompts/code-review-prompt.md)
 
-          REVIEW_FILE="review_output.md"
+           REVIEW_FILE="review_output.md"
           : > "$REVIEW_FILE"
           HAS_REVIEW=false
           FILE_COUNT=0
+          MAX_REVIEW_FILES=10
+          SKIPPED_FILES=""
           CHANGED_FILES=$(cat changed_files.txt)
+
+          # ── Check API key early ──
+          if [ -z "$SENSENOVA_API_KEY" ] || [ "${#SENSENOVA_API_KEY}" -lt 8 ]; then
+            echo "::error::SENSENOVA_API_KEY is not set or invalid. Aborting."
+            exit 1
+          fi
 
           if [ -z "$CHANGED_FILES" ]; then
             echo "No files changed, skipping review." >> "$REVIEW_FILE"
           else
             while IFS= read -r FILE; do
+              NL=$'\n'
               [ -z "$FILE" ] && continue
+              if [ "${FILE_COUNT}" -ge "${MAX_REVIEW_FILES}" ]; then
+                echo "  [SKIP] $FILE — max ${MAX_REVIEW_FILES} files reached"
+                SKIPPED_FILES="${SKIPPED_FILES}  - $FILE${NL}"
+                continue
+              fi
               echo "Reviewing: $FILE"
 
               # ── Get per-file diff ──
-              DIFF=$(git diff "origin/$BASE_REF...HEAD" -- "$FILE" 2>/dev/null || true)
-              if [ -z "$DIFF" ]; then
-                echo "  [SKIP] $FILE — no diff (binary or unchanged)"
+              DIFF=$(git diff "origin/$BASE_REF...HEAD" -- "$FILE" 2>/dev/null) || { echo "  [ERROR] git diff failed for $FILE"; continue; }
+
+              # ── Check if binary via git diff ──
+              if echo "$DIFF" | grep -q "^Binary files "; then
+                echo "  [SKIP] $FILE — binary file (detected by git diff)"
                 continue
               fi
 
-              # ── Checkif binary ──
-              if echo "$DIFF" | head -1 | grep -q "^Binary files"; then
-                echo "  [SKIP] $FILE — binary file"
-                continue
+              # ── If empty (new file / special chars), show full content ──
+              if [ -z "$DIFF" ]; then
+                # Check file type before generating virtual diff
+                if [ -f "$FILE" ] && file -b --mime-encoding "$FILE" 2>/dev/null | grep -q binary; then
+                  echo "  [SKIP] $FILE — binary file (detected by file command)"
+                  continue
+                fi
+                LINE_COUNT=$(wc -l < "$FILE" 2>/dev/null) || { echo "  [SKIP] $FILE — cannot read"; continue; }
+                if [ "${LINE_COUNT}" -gt 2000 ]; then
+                  echo "  [SKIP] $FILE — too large (${LINE_COUNT} lines, max 2000)"
+                  continue
+                fi
+                DIFF="--- /dev/null${NL}+++ b/$FILE${NL}@@ -0,0 +1,$LINE_COUNT @@${NL}$(sed 's/^/+/' "$FILE")"
               fi
 
               # ── Build user message ──
-              USER_MSG="请 review 以下文件变更：\n\n文件: $FILE\n\n\`\`\`diff\n$DIFF\n\`\`\`"
+              USER_MSG="请 review 以下文件变更：${NL}${NL}文件: $FILE${NL}${NL}\`\`\`diff${NL}$DIFF${NL}\`\`\`"
 
               # ── Escape for JSON ──
               # Use jq to build the payload safely
@@ -83,10 +108,13 @@ jobs:
                     {role: "user", content: $user}
                   ],
                   stream: false
-                }')
+                }') || { echo "  [ERROR] Failed to build JSON payload for $FILE"; continue; }
 
               # ── Call SenseNova API ──
-              RESPONSE=$(curl -s -w "\n%{http_code}" \
+              if [ "${FILE_COUNT:-0}" -gt 0 ]; then
+                sleep 1  # rate-limit: 1s gap between files
+              fi
+              RESPONSE=$(curl -s --max-time 60 --retry 3 --retry-all-errors -w "\n%{http_code}" \
                 "https://token.sensenova.cn/v1/chat/completions" \
                 -H "Authorization: Bearer $SENSENOVA_API_KEY" \
                 -H "Content-Type: application/json" \
@@ -96,8 +124,9 @@ jobs:
               BODY=$(echo "$RESPONSE" | sed '$d')
 
               if [ "$HTTP_CODE" != "200" ]; then
-                echo "  [ERROR] HTTP $HTTP_CODE for $FILE"
-                echo "  Response: $(echo "$BODY" | head -5)"
+                FILE_SIZE=$(wc -c < "$FILE" 2>/dev/null || echo "?")
+                echo "  [ERROR] HTTP $HTTP_CODE for $FILE (${FILE_SIZE}B)"
+                echo "  Response: $(echo "$BODY" | head -3)"
                 continue
               fi
 
@@ -126,18 +155,37 @@ jobs:
           fi
 
           # ── Final summary ──
-          if [ "$HAS_REVIEW" = false ]; then
-            printf '%s\n' '## 🤖 AI Code Review' '' 'No reviewable changes found (all files binary, unchanged, or empty).' > "$REVIEW_FILE"
-          else
-            SUMMARY=$(printf '# 🤖 AI Code Review\n\n> 共审查 **%s** 个变更文件\n\n' "${FILE_COUNT}")
-            {
-              echo "$SUMMARY"
-              echo ""
+          {
+            echo "# 🤖 AI Code Review"
+            echo ""
+            echo "> 共审查 **${FILE_COUNT}** 个变更文件"
+            if [ -n "$SKIPPED_FILES" ]; then
+              SKIP_COUNT=$(echo "$SKIPPED_FILES" | grep -c '  - ' || true)
+              echo "> ⚠️ 另有 **${SKIP_COUNT}** 个文件超过上限（最多 ${MAX_REVIEW_FILES} 个）未审查"
+            fi
+            echo ""
+            if [ "$HAS_REVIEW" = true ]; then
               cat "$REVIEW_FILE"
-            } > "${REVIEW_FILE}.tmp" && mv "${REVIEW_FILE}.tmp" "$REVIEW_FILE"
-          fi
+            else
+              echo "No reviewable changes found (all files binary, unchanged, or empty)."
+            fi
+            if [ -n "$SKIPPED_FILES" ]; then
+              echo ""
+              echo "---"
+              echo "### ⚠️ 未审查的文件"
+              printf '%b' "$SKIPPED_FILES"
+            fi
+          } > "${REVIEW_FILE}.tmp"
+          mv "${REVIEW_FILE}.tmp" "$REVIEW_FILE"
 
           echo "Review written to $REVIEW_FILE"
+
+      - name: Upload review artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-code-review
+          path: review_output.md
+          if-no-files-found: ignore
 
       - name: Post review comment
         uses: actions/github-script@v7
