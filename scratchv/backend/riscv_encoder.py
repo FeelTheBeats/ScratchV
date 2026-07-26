@@ -363,7 +363,20 @@ class RISCVAEncoder:
             word = _r_type(rd, rs1, rs2, F3_AND, 0b0000000)
         elif op == "lw":
             rd = _reg_num(operands[0])
-            offset, rs1 = self._parse_mem(operands[1])
+            mem_op = operands[1]
+            if "(" in mem_op and ")" in mem_op:
+                before = mem_op[:mem_op.index("(")]
+                after = mem_op[mem_op.index("(") + 1:mem_op.index(")")]
+                if before in REG_MAP or before.startswith("x"):
+                    # Compiler syntax: lw rd, rs1(offset)
+                    rs1 = _reg_num(before)
+                    offset = self._parse_imm(after) if after else 0
+                else:
+                    # Standard syntax: lw rd, offset(rs1)
+                    offset = self._parse_imm(before) if before else 0
+                    rs1 = _reg_num(after)
+            else:
+                offset, rs1 = 0, 0
             word = _i_type(rd, rs1, offset, F3_LW, RVOpcode.LOAD)
         elif op == "sw":
             # Handle both standard (sw rs2, offset(rs1)) and compiler
