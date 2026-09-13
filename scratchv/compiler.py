@@ -218,6 +218,9 @@ class CompilerDriver:
 
     def __init__(self, config: CompilerConfig | None = None):
         self.config = config or CompilerConfig()
+        # Structured statistics produced by assembly-level passes
+        # (currently the instruction scheduler); consumed by compile().
+        self._asm_pass_stats: dict[str, Any] = {}
 
     # ── Public API ──────────────────────────────────────────────────────────
 
@@ -316,7 +319,11 @@ class CompilerDriver:
             output_text=asm_text,
             output_path=output_path,
             ir_dump=ir_dump,
-            stats={"opt_message": opt_message, "cycle_report": cycle_report},
+            stats={
+                "opt_message": opt_message,
+                "cycle_report": cycle_report,
+                **self._asm_pass_stats,
+            },
             warnings=warnings,
         )
 
@@ -442,6 +449,7 @@ class CompilerDriver:
 
     def _run_asm_passes(self, asm_text: str, warnings: list[str]) -> str:
         """Run assembly-level passes (peephole, const-merge, beautify, etc.)."""
+        self._asm_pass_stats = {}
         if self.config.peephole_asm:
             from scratchv.backend.asm_peephole import AsmPeepholeOptimizer
             opt = AsmPeepholeOptimizer()
@@ -461,16 +469,12 @@ class CompilerDriver:
 
         if self.config.schedule:
             from scratchv.backend.inst_scheduler import (
-                InstructionScheduler, parse_instructions,
+                ScheduleConfig, schedule_asm,
             )
-            sched = InstructionScheduler()
-            insts = parse_instructions(asm_text)
-            dag = sched.build_dag(insts)
-            scheduled = sched.schedule(dag)
-            asm_text = "\n".join(
-                f"  {inst.opcode} " + ", ".join(inst.operands)
-                for inst in scheduled
-            )
+            schedule_result = schedule_asm(asm_text, ScheduleConfig())
+            asm_text = schedule_result.asm_text
+            warnings.extend(schedule_result.warnings)
+            self._asm_pass_stats["schedule"] = schedule_result.stats
 
         if self.config.beautify_asm:
             from scratchv.backend.asm_beautifier import beautify_asm
