@@ -19,6 +19,7 @@ Usage::
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -29,10 +30,12 @@ from scratchv.backend.machine_types import (
     MachineOp,
     MachineOperand,
 )
-from scratchv.backend.regalloc_linear import (
-    LinearScanAllocator,
-    block_from_machine_instrs,
-)
+from scratchv.backend.regalloc_linear import LinearScanAllocator, RegAllocError
+
+_MEM_OPERAND_RE = re.compile(r"^(-?\d+)\((\w+)\)$")
+
+# Comments the linear-scan allocator attaches to inserted spill/reload code.
+_SPILL_COMMENT_MARKERS = ("reload ", "evict ", "store redefined ")
 
 
 def align16(size: int) -> int:
@@ -273,26 +276,52 @@ class FunctionFrameAllocator:
         global_slots = {v: 4 * i for i, v in enumerate(sorted(cross))}
         global_bytes = 4 * len(global_slots)
 
-        used_callee: set[str] = set()
-        block_bases: list[int] = []
+        # Emit every block once.  A block's spill area starts after the
+        # areas actually consumed by the previous blocks (including the
+        # slots that reload-time eviction adds during emission), so the
+        # frame size below is the upper bound of the emitted code instead of
+        # a pass-1 estimate that pass 2 can outgrow (F1).
+        block_outputs: list[list[MachineInstr]] = []
         total_local = 0
         for block in blocks:
-            ls_block = block_from_machine_instrs(block)
-            local = cross & {
-                v for i in ls_block for v in (i.defines | i.uses)}
+            base = global_bytes + total_local
+            local = cross & {v for i in block for v in _vregs_of(i)}
             alloc = self._make_allocator(
-                stack_base=global_bytes, pre_spilled=local,
+                stack_base=base, pre_spilled=local,
                 slot_hints=global_slots)
-            alloc.allocate(alloc.compute_live_intervals(ls_block))
-            used_callee |= alloc.used_callee_saved
-            block_bases.append(global_bytes + total_local)
-            total_local += 4 * len([
-                v for v in alloc.spill_slots if v not in global_slots])
+            block_out = alloc.emit_machine_instrs(block)
+            block_outputs.append(block_out)
+            local_slots = {
+                slot for v, slot in alloc.spill_slots.items()
+                if v not in global_slots
+            }
+            expected = {base + 4 * i for i in range(len(local_slots))}
+            if local_slots != expected:
+                raise RegAllocError(
+                    f"frame layout for {func.name!r}: block spill slots "
+                    f"{sorted(local_slots)} do not tile its region "
+                    f"[{base}, {base + 4 * len(local_slots)})")
+            total_local += 4 * len(local_slots)
 
+        spill_bytes = global_bytes + total_local
+        # The saved set is collected from the emitted instructions (not from
+        # the static allocation map): reload targets and scratch registers
+        # are picked dynamically during emission and may land on a
+        # callee-saved register that pass 1 never assigned (F3).
+        used_callee = self._callee_saved_regs(block_outputs)
         has_call = _has_call(func.instrs)
         saved = ["ra"] if has_call else []
         saved += [r for r in CALLEE_SAVED if r in used_callee]
-        frame_size = align16(global_bytes + total_local + 4 * len(saved))
+        frame_size = align16(spill_bytes + 4 * len(saved))
+
+        save_area_start = frame_size - 4 * len(saved)
+        if spill_bytes > save_area_start:
+            raise RegAllocError(
+                f"frame layout for {func.name!r}: spill area "
+                f"[0, {spill_bytes}) overlaps save area "
+                f"[{save_area_start}, {frame_size})")
+        self._check_spill_bounds(block_outputs, spill_bytes)
+
         info = FrameInfo(
             frame_size=frame_size,
             ra_offset=(frame_size - 4) if has_call else None,
@@ -310,14 +339,51 @@ class FunctionFrameAllocator:
             out = []
         out.extend(emit_prologue(info))
 
-        for base, block in zip(block_bases, blocks):
-            local = cross & {v for i in block for v in _vregs_of(i)}
-            alloc = self._make_allocator(
-                stack_base=base, pre_spilled=local,
-                slot_hints=global_slots)
-            block_out = alloc.emit_machine_instrs(block)
+        for block_out in block_outputs:
             for instr in block_out:
                 if _is_ret(instr):
                     out.extend(emit_epilogue(info))
                 out.append(instr)
         return out
+
+    @staticmethod
+    def _callee_saved_regs(
+        block_outputs: list[list[MachineInstr]],
+    ) -> set[str]:
+        """Callee-saved registers mentioned by the emitted function body.
+
+        Conservative (a register only read is saved too): the prologue store
+        is harmless in that case, while missing one for a dynamically chosen
+        reload/scratch target corrupts the caller's state.
+        """
+        used: set[str] = set()
+        for block_out in block_outputs:
+            for instr in block_out:
+                for op in _operands_of(instr):
+                    if (op is not None and op.kind == "reg"
+                            and str(op.value) in CALLEE_SAVED):
+                        used.add(str(op.value))
+        return used
+
+    @staticmethod
+    def _check_spill_bounds(
+        block_outputs: list[list[MachineInstr]],
+        spill_bytes: int,
+    ) -> None:
+        """Every allocator-inserted spill/reload access must stay in the
+        spill area ``[0, spill_bytes)`` (fail loudly on layout drift)."""
+        for block_out in block_outputs:
+            for instr in block_out:
+                if not instr.comment.startswith(_SPILL_COMMENT_MARKERS):
+                    continue
+                for op in _operands_of(instr):
+                    if op is None or op.kind != "mem":
+                        continue
+                    match = _MEM_OPERAND_RE.match(str(op.value))
+                    if match is None or match.group(2) != "sp":
+                        continue
+                    offset = int(match.group(1))
+                    if offset < 0 or offset + 4 > spill_bytes:
+                        raise RegAllocError(
+                            f"spill access {op.value} outside spill area "
+                            f"[0, {spill_bytes}) in {instr!r}")

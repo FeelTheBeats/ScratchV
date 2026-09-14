@@ -464,6 +464,23 @@ class CompilerDriver:
 
     def _generate_riscv_dag(self, program) -> str:
         """DAG-based instruction selection pipeline."""
+        # Same mode normalisation/validation as the non-DAG path: the DAG
+        # pipeline supports naive/greedy only, so an unsupported mode must
+        # fail loudly instead of silently degrading to greedy (F6).
+        mode = self.config.reg_alloc
+        if mode == "linear-v1.5":  # transitional alias
+            mode = "linear"
+        if mode not in ("naive", "greedy", "linear"):
+            raise ValueError(
+                f"unknown reg_alloc mode: {self.config.reg_alloc!r} "
+                "(expected naive, greedy, or linear)"
+            )
+        if mode == "linear":
+            raise ValueError(
+                "reg_alloc='linear' is not supported by the DAG instruction "
+                "selection path; use the non-DAG pipeline or 'greedy'"
+            )
+
         from scratchv_dag.selection_dag import DAGBuilder, DAGCombiner, DAGScheduler
         from scratchv.backend.register_alloc import RegisterAllocator
         from scratchv.backend.asm_emit import AsmEmitter
@@ -477,7 +494,7 @@ class CompilerDriver:
         scheduler = DAGScheduler(dag)
         machine_instrs = scheduler.run()
 
-        alloc = RegisterAllocator(machine_instrs, mode=self.config.reg_alloc)
+        alloc = RegisterAllocator(machine_instrs, mode=mode)
         allocated = alloc.run()
 
         emitter = AsmEmitter(allocated)

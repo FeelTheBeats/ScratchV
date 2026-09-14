@@ -554,6 +554,10 @@ class LinearScanAllocator:
                 )
 
             renamed_ops = [rename.get(o, o) for o in inst.operands]
+            if self.strict:
+                # I2 backstop; the non-strict pressure-measurement mode
+                # deliberately counts fallbacks instead of raising.
+                self._check_operand_aliases(inst, renamed_ops)
             out.append(LsInstruction(
                 inst.id, inst.opcode, renamed_ops,
                 defines=set(inst.defines), uses=set(inst.uses),
@@ -564,6 +568,29 @@ class LinearScanAllocator:
                 out.append(_parse_line(line, inst.id))
 
         return out
+
+    def _check_operand_aliases(
+        self, inst: LsInstruction, renamed_ops: list[str],
+    ) -> None:
+        """Enforce invariant I2 on one emitted instruction.
+
+        Distinct vreg *source* operands must end up in pairwise distinct
+        physical registers.  Repeating the same vreg is allowed; a pure
+        definition may share its register with one source (invariant I3:
+        ``lw t0, …; add t0, t0, t1``).  Raises ``RegisterAliasError``
+        otherwise; this is the output-time backstop for dynamic eviction
+        bugs such as the stale-owner double eviction (F2/F7).
+        """
+        seen: dict[str, str] = {}
+        for orig, new in zip(inst.operands, renamed_ops):
+            if orig not in inst.uses:
+                continue
+            prev = seen.get(new)
+            if prev is not None and prev != orig:
+                raise RegisterAliasError(
+                    f"position {inst.id}: {prev} and {orig} both map to "
+                    f"{new} (invariant I2 violated)")
+            seen[new] = orig
 
     def _occupied_at(self, pos: int, inst: LsInstruction) -> dict[str, str]:
         """Return the exclusive ``preg -> vreg`` ownership map at *pos*.
@@ -608,17 +635,21 @@ class LinearScanAllocator:
         """Select an evictable (vreg, preg); return None if none qualifies.
 
         Constraints: the register must actually be in use, the vreg must
-        not be an operand of the current instruction, the vreg must have a
-        future use (otherwise eviction buys nothing), and the register
-        must be exclusively owned.  Ties break by vreg name for determinism.
+        not be an operand of the current instruction, the vreg must not
+        already be spilled, the vreg must have a future use (otherwise
+        eviction buys nothing), and the register must be exclusively owned.
+        Ties break by vreg name for determinism.  The victim's register is
+        taken from the live ownership map (``owners``) rather than from the
+        possibly stale ``alloc_map`` (F2).
         """
         protected = inst.uses | inst.defines
         best: Optional[str] = None
+        best_reg: Optional[str] = None
         best_end = -1
         for r, v in owners.items():
             if r not in used:
                 continue
-            if v in protected:
+            if v in protected or v in self._spilled:
                 continue
             iv = self._vreg_interval.get(v)
             if iv is None:
@@ -627,10 +658,10 @@ class LinearScanAllocator:
                 continue
             if iv.end > best_end or (iv.end == best_end
                                      and best is not None and v < best):
-                best, best_end = v, iv.end
-        if best is None:
+                best, best_reg, best_end = v, r, iv.end
+        if best is None or best_reg is None:
             return None
-        return best, self.alloc_map[best]
+        return best, best_reg
 
     def _pick_reload_reg(
         self,
@@ -651,7 +682,10 @@ class LinearScanAllocator:
         if vreg in loaded:
             return loaded[vreg], []
 
-        used = set(owners) | set(loaded.values())
+        # Invariant I4: never target a register the instruction itself uses
+        # as a physical operand (e.g. ``mv a0, …`` / ``add …, a0, …``).
+        used = set(owners) | set(loaded.values()) | {
+            o for o in inst.operands if o in REG_NUMS}
 
         for r in self.phys_regs:
             if r not in used:
@@ -680,7 +714,12 @@ class LinearScanAllocator:
             f"  sw {reg}, {slot_v}(sp)  # evict {victim} for reload"
         ]
         self._spilled.add(victim)
+        self.alloc_map[victim] = f"SPILL_{victim}"
         rename[victim] = f"SPILL_{victim}"
+        # The victim's register stops being owned as soon as its value is
+        # stored; refresh the ownership map so a second reload in the same
+        # instruction cannot evict the same (already spilled) victim (F2).
+        owners.pop(reg, None)
         iv = self._vreg_interval.get(victim)
         if iv is not None:
             for u in sorted(iv.uses):
