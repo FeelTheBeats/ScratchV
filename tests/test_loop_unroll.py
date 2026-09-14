@@ -16,6 +16,8 @@ directional acceptance criteria here.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from scratchv.analysis.ir_verifier import ErrorLevel, IRVerifier
 from scratchv.ir.builder import IRBuilder
 from scratchv.ir.types import DataType, OpCode, Program
@@ -74,6 +76,62 @@ def build_low_pressure_program(end: int, start: int = 0):
     return builder.program
 
 
+def build_carried_param_simple_program(end: int):
+    """Carried accumulator without iv use: ``acc = acc + one``.
+
+    ``acc`` is a function parameter, so it has no definition outside the
+    loop and the body self-reference (``dest == operand``) is its only
+    definition; the low vreg count keeps partial unrolls runnable through
+    today's backend.
+    """
+    builder = IRBuilder()
+    acc = builder.make_value(
+        name="acc", dtype=DataType.INT32, is_constant=False)
+    builder.new_function("main", params=[acc])
+    builder.new_block("entry")
+    one = _make_const(builder, "one", 1)
+    builder.for_loop(0, end)
+    builder._emit(OpCode.ADD, acc, [acc, one])
+    builder.endfor()
+    builder.ret(acc)
+    return builder.program
+
+
+def build_carried_param_program(end: int, start: int = 0):
+    """Probe-style carried accumulator: ``acc = acc + (iv + one)``.
+
+    ``acc`` is a function parameter, so it is never defined before the loop
+    and the body self-reference is the only definition of ``acc``.
+    """
+    builder = IRBuilder()
+    acc = builder.make_value(
+        name="acc", dtype=DataType.INT32, is_constant=False)
+    builder.new_function("main", params=[acc])
+    builder.new_block("entry")
+    one = _make_const(builder, "one", 1)
+    iv = builder.for_loop(start, end)
+    t = builder.add(iv, one)
+    builder._emit(OpCode.ADD, acc, [acc, t])
+    builder.endfor()
+    builder.ret(acc)
+    return builder.program
+
+
+def build_forward_ref_program(end: int):
+    """Body reads ``u`` before defining it, then defines ``u`` (forward)."""
+    builder = IRBuilder()
+    builder.new_function("main")
+    builder.new_block("entry")
+    u = builder.make_value(name="u", dtype=DataType.INT32, is_constant=False)
+    one = _make_const(builder, "one", 1)
+    iv = builder.for_loop(0, end)
+    t = builder.add(u, one)
+    builder._emit(OpCode.ADD, u, [iv, one])
+    builder.endfor()
+    builder.ret(t)
+    return builder.program
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Helpers (documented as TestCaseHelpers in the design document)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -107,16 +165,21 @@ def emit_asm(program: Program) -> str:
     return AsmEmitter(allocated).emit()
 
 
-def run_rv32(program: Program) -> tuple[int, int]:
-    """Run the compiled program; return ``(a0, dynamic_instruction_count)``."""
+def run_asm_text(asm: str) -> tuple[int, int]:
+    """Assemble and run *asm*; return ``(a0, dynamic_instruction_count)``."""
     from scratchv.backend.riscv_encoder import assemble_to_binary
     from scratchv.simulator.rv32_emulator import REG_ID, RV32Emulator
 
-    binary = assemble_to_binary(emit_asm(program))
+    binary = assemble_to_binary(asm)
     emulator = RV32Emulator()
     emulator.load_code(bytes(binary))
     dynamic = emulator.run()
     return emulator.regs[REG_ID["a0"]], dynamic
+
+
+def run_rv32(program: Program) -> tuple[int, int]:
+    """Run the compiled program; return ``(a0, dynamic_instruction_count)``."""
+    return run_asm_text(emit_asm(program))
 
 
 def verify_errors(program: Program):
@@ -361,7 +424,8 @@ class TestLoopUnrollEpilogue:
         assert epilogue_for.attrs["start"] == 6
         assert epilogue_for.attrs["end"] == 7
         assert epilogue_for.attrs["step"] == 1
-        assert "unrolled" not in epilogue_for.attrs
+        # the remainder loop carries the idempotency marker too (F5)
+        assert epilogue_for.attrs["unrolled"] == 1
 
         # setup 2 + main (FOR + 18 + ENDFOR) + epilogue (FOR + 2 + ENDFOR)
         assert count_ir(program) == 28
@@ -391,6 +455,96 @@ class TestLoopUnrollEpilogue:
         assert dynamic_before == 41
         assert dynamic_after == 32
         assert dynamic_after < dynamic_before
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Case 3b: true loop-carried values (dest == operand) — F1/F3
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestLoopUnrollCarriedValues:
+    """Simulation coverage for genuine loop-carried values.
+
+    ``build_carried_param_simple_program`` keeps the vreg count below the point
+    where the known encoder temp-register fallback corrupts partial
+    unrolls (an existing backend defect, not fixed in this topic), so the
+    partial/exact and epilogue numbers below are checked end-to-end.
+    """
+
+    def test_full_unroll_carried_value_simulation(self):
+        baseline = build_carried_param_program(4)
+        a0_before, dynamic_before = run_rv32(baseline)
+
+        optimized = build_carried_param_program(4)
+        unroll = LoopUnroll(optimized)
+        assert unroll.run() == 1
+        assert unroll.stats["full_unrolls"] == 1
+        a0_after, dynamic_after = run_rv32(optimized)
+
+        assert a0_before == a0_after == 10  # sum(1..4)
+        assert dynamic_after < dynamic_before
+        assert verify_errors(optimized) == []
+
+    def test_partial_exact_carried_value_simulation(self):
+        baseline = build_carried_param_simple_program(6)
+        a0_before, dynamic_before = run_rv32(baseline)
+
+        optimized = build_carried_param_simple_program(6)
+        unroll = LoopUnroll(
+            optimized, full_threshold=2, max_factor=2)
+        assert unroll.run() == 1
+        assert unroll.stats["partial_unrolls"] == 1
+        assert unroll.stats["partial_epilogues"] == 0
+        a0_after, dynamic_after = run_rv32(optimized)
+
+        assert a0_before == a0_after == 6  # one increment per iteration
+        assert dynamic_after < dynamic_before
+        assert verify_errors(optimized) == []
+
+    def test_epilogue_r1_carried_value_simulation(self):
+        baseline = build_carried_param_simple_program(5)
+        a0_before, dynamic_before = run_rv32(baseline)
+
+        optimized = build_carried_param_simple_program(5)
+        unroll = LoopUnroll(
+            optimized, full_threshold=2, max_factor=2, epilogue=True)
+        assert unroll.run() == 1
+        assert unroll.stats["partial_epilogues"] == 1
+        a0_after, dynamic_after = run_rv32(optimized)
+
+        assert a0_before == a0_after == 5  # one increment per iteration
+        assert dynamic_after < dynamic_before
+        assert verify_errors(optimized) == []
+
+    def test_epilogue_r_gt1_carried_value_is_skipped(self):
+        """F1: never emit the stale-value epilogue; leave the loop alone."""
+        program = build_carried_param_program(11)
+        before = fingerprint(program)
+
+        unroll = LoopUnroll(program, full_threshold=2, epilogue=True)
+        assert unroll.run() == 0
+        assert fingerprint(program) == before
+        assert unroll.stats["skipped"]["carried_value"] == 1
+        assert unroll.stats["loops_unrolled"] == 0
+
+        a0, _ = run_rv32(program)
+        assert a0 == 66  # sum(1..11), the pre-pass semantics
+
+    def test_epilogue_r_gt1_forward_reference_is_skipped(self):
+        program = build_forward_ref_program(11)
+        before = fingerprint(program)
+
+        unroll = LoopUnroll(program, full_threshold=2, epilogue=True)
+        assert unroll.run() == 0
+        assert fingerprint(program) == before
+        assert unroll.stats["skipped"]["carried_value"] == 1
+
+    def test_epilogue_skips_only_carried_shapes(self):
+        """The new guard must not reject carried-free epilogue loops."""
+        program = build_low_pressure_program(11)
+        unroll = LoopUnroll(program, full_threshold=2, epilogue=True)
+        assert unroll.run() == 1
+        assert unroll.stats["partial_epilogues"] == 1
+        assert unroll.stats["skipped"]["carried_value"] == 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -465,6 +619,73 @@ class TestLoopUnrollNegative:
         assert unroll.run() == 0
         assert fingerprint(builder.program) == before
         assert unroll.stats["skipped"]["multi_def"] == 1
+
+    def test_skip_counts_stable_across_rescans(self):
+        """F4: rescanning after each unroll must not inflate skip counters."""
+        builder = IRBuilder()
+        builder.new_function("main")
+        builder.new_block("entry")
+        one = _make_const(builder, "one", 1)
+        for _ in range(3):
+            iv = builder.for_loop(0, 4, step=2)
+            builder.add(iv, one)
+            builder.endfor()
+        iv4 = builder.for_loop(0, 4)
+        builder.add(iv4, one)
+        builder.endfor()
+        builder.ret()
+
+        unroll = LoopUnroll(builder.program)
+        assert unroll.run() == 1
+        assert unroll.stats["skipped"]["step_not_one"] == 3
+        assert unroll.stats["loops_seen"] == 4
+
+
+class TestLoopUnrollIdempotency:
+    def test_epilogue_remainder_loop_is_idempotent(self):
+        """F5: the generated remainder loop carries the marker too."""
+        program = build_low_pressure_program(23)
+        unroll = LoopUnroll(program, full_threshold=2, epilogue=True)
+        assert unroll.run() == 1
+        assert unroll.stats["partial_epilogues"] == 1
+
+        markers = [
+            ins.attrs.get("unrolled") for _, ins in find_for_indices(program)
+        ]
+        assert markers == [8, 1]
+
+        before = fingerprint(program)
+        assert unroll.run() == 0
+        assert fingerprint(program) == before
+        assert unroll.stats["loops_unrolled"] == 0
+
+
+class _ExplodingLoopUnroll(LoopUnroll):
+    """Applies a plan, then raises to exercise the rollback path."""
+
+    def _apply_unroll(self, func, block, for_idx, endfor_idx, plan):
+        super()._apply_unroll(func, block, for_idx, endfor_idx, plan)
+        raise RuntimeError("injected failure")
+
+
+class TestLoopUnrollRollback:
+    def test_failed_apply_restores_operands(self):
+        """F6: a mid-rewrite exception must restore operands as well."""
+        program = build_case_program(7, use_acc=True)
+        return_ins = block_instructions(program)[-1]
+        canonical = return_ins.operands[0]
+        before = fingerprint(program)
+
+        unroll = _ExplodingLoopUnroll(
+            program, full_threshold=2, epilogue=True)
+        assert unroll.run() == 0
+        assert unroll.stats["skipped"]["internal_error"] == 1
+        assert fingerprint(program) == before
+        # _redirect_uses rewrote this operand to ``v3__ep`` before the
+        # failure; the snapshot must bring the original value back.
+        restored = block_instructions(program)[-1].operands[0]
+        assert restored is canonical
+        assert restored.name == "v_3"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -546,7 +767,8 @@ class TestLoopUnrollIntegration:
         from scratchv.compiler import CompilerConfig, CompilerDriver
 
         driver = CompilerDriver(CompilerConfig(
-            optimize_level="all", dump_ir=True, reg_alloc="greedy"))
+            optimize_level="all", dump_ir=True, reg_alloc="greedy",
+            loop_unroll=True))
         result = driver.compile(
             "", str(tmp_path / "on.s"), dsl_source=self.DSL_SOURCE)
         assert result.success
@@ -574,12 +796,18 @@ class TestLoopUnrollIntegration:
 
         parser = build_arg_parser()
         defaults = args_to_config(parser.parse_args(["input.dsl"]))
-        assert defaults.loop_unroll is True
+        # opt-in by default: the greedy allocator reload defect (B2) makes
+        # unrolling unsafe as a default at optimize_level "all"
+        assert defaults.loop_unroll is False
         assert defaults.unroll_max_factor == 8
         assert defaults.unroll_full_threshold == 8
         assert defaults.unroll_body_limit == 64
         assert defaults.unroll_max_growth == 512
         assert defaults.unroll_epilogue is False
+
+        opt_in = args_to_config(
+            parser.parse_args(["input.dsl", "--loop-unroll"]))
+        assert opt_in.loop_unroll is True
 
         args = args_to_config(parser.parse_args([
             "input.dsl", "--no-loop-unroll", "--unroll-factor", "4",
@@ -592,6 +820,14 @@ class TestLoopUnrollIntegration:
         assert args.unroll_body_limit == 32
         assert args.unroll_max_growth == 100
         assert args.unroll_epilogue is True
+
+        # last flag wins when both are given
+        both_off = args_to_config(parser.parse_args(
+            ["input.dsl", "--loop-unroll", "--no-loop-unroll"]))
+        assert both_off.loop_unroll is False
+        both_on = args_to_config(parser.parse_args(
+            ["input.dsl", "--no-loop-unroll", "--loop-unroll"]))
+        assert both_on.loop_unroll is True
 
     def test_no_loop_unroll_matches_default_on_loop_free_program(
             self, tmp_path):
@@ -606,6 +842,105 @@ class TestLoopUnrollIntegration:
             "", str(tmp_path / "off.s"), dsl_source=source)
         assert on.success and off.success
         assert on.output_text == off.output_text
+
+
+class TestLoopUnrollDefaultOff:
+    """F2: unrolling is opt-in until the allocator reload defect is fixed.
+
+    The default ``--optimize all`` pipeline must keep compiling the
+    pre-topic way; ``--loop-unroll`` / ``loop_unroll=True`` opts in and is
+    exercised on a low-pressure loop where the backend is still correct.
+    """
+
+    HIGH_PRESSURE_DSL = (
+        "for i = 0, 12\n"
+        "  t = add(i, one)\n"
+        "  u = add(t, one)\n"
+        "  v = add(u, one)\n"
+        "endfor\n"
+        "return v\n"
+    )
+
+    LOW_PRESSURE_DSL = (
+        "for i = 0, 6\n"
+        "  t = add(i, one)\n"
+        "endfor\n"
+        "return t\n"
+    )
+
+    def test_config_default_is_off(self):
+        from scratchv.compiler import CompilerConfig
+
+        assert CompilerConfig().loop_unroll is False
+
+    def test_default_flags_compile_high_pressure_loop_correctly(
+            self, tmp_path):
+        from scratchv.compiler import CompilerConfig, CompilerDriver
+
+        driver = CompilerDriver(CompilerConfig(
+            optimize_level="all", dump_ir=True, reg_alloc="greedy"))
+        result = driver.compile(
+            "", str(tmp_path / "default.s"),
+            dsl_source=self.HIGH_PRESSURE_DSL)
+        assert result.success
+        assert "loop-unroll" not in result.stats["passes"]
+        assert "endfor" in result.ir_dump.split("--- IR Dump (after")[1]
+
+        a0, _ = run_asm_text(result.output_text)
+        # ``one`` is a free (never defined) value read as 0, so the loop
+        # yields i + 3*0 = 11; re-enabling unroll by default before the
+        # allocator is fixed made the greedy backend return 10 here.
+        assert a0 == 11
+
+    def test_opt_in_unroll_is_correct_and_faster_on_low_pressure(
+            self, tmp_path):
+        from scratchv.compiler import CompilerConfig, CompilerDriver
+
+        common = dict(optimize_level="all", reg_alloc="greedy")
+        off = CompilerDriver(CompilerConfig(**common)).compile(
+            "", str(tmp_path / "off.s"), dsl_source=self.LOW_PRESSURE_DSL)
+        on = CompilerDriver(CompilerConfig(
+            loop_unroll=True, **common)).compile(
+            "", str(tmp_path / "on.s"), dsl_source=self.LOW_PRESSURE_DSL)
+        assert off.success and on.success
+        assert "loop-unroll" not in off.stats["passes"]
+        assert "loop-unroll" in on.stats["passes"]
+
+        a0_off, dyn_off = run_asm_text(off.output_text)
+        a0_on, dyn_on = run_asm_text(on.output_text)
+        assert a0_off == a0_on == 5
+        assert dyn_on < dyn_off
+
+
+class TestNoLoopUnrollGolden:
+    """F3: byte-level pre-topic compatibility on real benchmark cases."""
+
+    CASES = ("013_for_sum", "014_for_dot", "019_nested_loop")
+
+    def test_cli_matches_baseline_golden(self, tmp_path):
+        from scratchv.main import main
+
+        root = Path(__file__).parents[1]
+        golden_dir = Path(__file__).parent / "golden"
+        for case in self.CASES:
+            source = root / "benchmarks" / "cases" / f"{case}.dsl"
+            # ``.golden`` suffix: plain ``*.s`` is gitignored as build output
+            expected = (golden_dir / f"{case}.s.golden").read_text()
+
+            off = tmp_path / f"{case}_off.s"
+            assert main([
+                str(source), "--optimize", "all", "--no-loop-unroll",
+                "--count-instr", "-o", str(off),
+            ]) == 0
+            assert off.read_text() == expected
+
+            # default flags (opt-in off) must reproduce the same bytes
+            default = tmp_path / f"{case}_default.s"
+            assert main([
+                str(source), "--optimize", "all",
+                "--count-instr", "-o", str(default),
+            ]) == 0
+            assert default.read_text() == expected
 
 
 # ═══════════════════════════════════════════════════════════════════════════
