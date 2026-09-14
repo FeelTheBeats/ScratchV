@@ -289,6 +289,12 @@ class TestErrorCollector:
         assert collector.limit_reached
         assert "further errors suppressed" in collector.report()
 
+    @pytest.mark.parametrize("max_errors", [0, -1, -20])
+    def test_non_positive_max_errors_rejected(self, max_errors):
+        # A zero/negative limit silently suppressed every error; reject loud.
+        with pytest.raises(ValueError, match="max_errors"):
+            ErrorCollector(max_errors=max_errors)
+
     def test_deduplicates_and_sorts_errors(self):
         collector = ErrorCollector(use_color=False)
         second = DSLSyntaxError(2, 3, "second", error_code="E200")
@@ -430,6 +436,7 @@ class TestErrorHierarchy:
         assert ErrorCode.SYN_NESTED_CALL == "E205"
         assert ErrorCode.SEM_UNKNOWN_OP == "E301"
         assert ErrorCode.SEM_ARITY == "E302"
+        assert ErrorCode.SEM_UNKNOWN_KWARG == "E304"
 
 
 class TestMarkerAlignment:
@@ -534,6 +541,20 @@ class TestCollectorExtensions:
         assert collector.suppressed_count == 7
         assert len(collector.errors) == 3
         assert "7 further errors suppressed" in collector.report()
+
+    def test_suppressed_duplicates_counted_once(self):
+        collector = ErrorCollector(max_errors=1)
+        collector.add(DSLSyntaxError(1, 1, "stored"))
+        duplicate = DSLSyntaxError(2, 2, "suppressed")
+        collector.add(duplicate)
+        collector.add(duplicate)
+        collector.add(duplicate)
+        # Repeated suppressed duplicates must not inflate the count.
+        assert collector.error_count == 1
+        assert collector.suppressed_count == 1
+        collector.add(DSLSyntaxError(3, 3, "another"))
+        assert collector.suppressed_count == 2
+        assert "2 further errors suppressed" in collector.report()
 
     def test_collector_source_context(self):
         source = "a = add(1)\nb = retrun(a, 2)\n"

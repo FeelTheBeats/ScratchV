@@ -412,6 +412,155 @@ class TestCollectorRecovery:
 
 
 # ---------------------------------------------------------------------------
+# F1 regression: malformed statements must not be silently accepted
+# ---------------------------------------------------------------------------
+
+class TestCollectorMalformedStatements:
+    @pytest.mark.parametrize(
+        ("source", "strict_code", "rich_code"),
+        [
+            ("return x junk\n", "E100", "E201"),
+            (
+                "for i = 0, 4 junk\nacc = add(acc, i)\nendfor\n",
+                "E100",
+                "E201",
+            ),
+            ("a = add(x, y, foo:1)\n", "E202", "E304"),
+            ("m = matmul(a, b, rows:abc)\n", "E203", "E304"),
+        ],
+    )
+    def test_malformed_statements_diagnosed_in_both_modes(
+        self, source, strict_code, rich_code,
+    ):
+        with pytest.raises(DSLSyntaxError) as excinfo:
+            ExtendedDSLParser().parse(source, filename="malformed.dsl")
+        assert excinfo.value.error_code == strict_code
+
+        collector = rich_errors(
+            ExtendedDSLParser(), source, "malformed.dsl",
+        )
+        assert collector.error_count >= 1
+        assert collector.suppressed_count == 0
+        assert rich_code in [e.error_code for e in collector.errors]
+
+    def test_invalid_kwarg_location_and_message(self):
+        collector = rich_errors(
+            ExtendedDSLParser(), "a = add(x, y, foo:1)\n", "kw.dsl",
+        )
+        error = collector.errors[0]
+        assert error.error_code == ErrorCode.SEM_UNKNOWN_KWARG == "E304"
+        assert (error.line, error.col) == (1, 15)
+        assert error.message == "invalid keyword argument 'foo'"
+        assert "'foo' is not accepted by add()" in (
+            format_error(error, use_color=False)
+        )
+
+        collector = rich_errors(
+            ExtendedDSLParser(), "m = matmul(a, b, rows:abc)\n", "kw.dsl",
+        )
+        error = collector.errors[0]
+        assert error.error_code == "E304"
+        assert (error.line, error.col) == (1, 18)
+        assert error.message == "'rows' requires a numeric value"
+
+    @pytest.mark.parametrize(
+        ("source", "opcode"),
+        [
+            ("d = dot(a, b, len:4)\n", "DOT"),
+            ("m = matmul(a, b, m:2, n:2, k:2)\n", "MATMUL"),
+            ("s = softmax(x, axis:-1)\n", "SOFTMAX"),
+            ("p = maxpool(x, kernel:2, stride:2)\n", "MAXPOOL"),
+        ],
+    )
+    def test_registered_kwargs_stay_accepted(self, source, opcode):
+        collector = ErrorCollector(
+            filename="kwargs_ok.dsl", use_color=False, source=source,
+        )
+        program = ExtendedDSLParser().parse(
+            source, filename="kwargs_ok.dsl", collector=collector,
+        )
+        assert collector.error_count == 0, collector.report()
+        opcodes = [
+            instr.opcode.name
+            for instr in program.functions[0].blocks[0].instructions
+        ]
+        assert opcode in opcodes
+
+    def test_return_prefix_identifier_is_not_swallowed(self):
+        # E2 root cause: 'returnx = add(a,b)' used to be read as 'return x'.
+        source = "returnx = add(a, b)\n"
+        collector = ErrorCollector(
+            filename="prefix.dsl", use_color=False, source=source,
+        )
+        program = ExtendedDSLParser().parse(
+            source, filename="prefix.dsl", collector=collector,
+        )
+        assert collector.error_count == 0
+        opcodes = [
+            instr.opcode.name
+            for instr in program.functions[0].blocks[0].instructions
+        ]
+        assert "ADD" in opcodes
+
+
+# ---------------------------------------------------------------------------
+# F2 regression: validator limit accounting
+# ---------------------------------------------------------------------------
+
+class TestValidatorLimitSemantics:
+    def test_suppressed_counts_all_unreported_line_errors(self):
+        source = "\n".join(f"retrun x{i}" for i in range(50)) + "\n"
+        collector = ExtendedDSLParser().validate(source, max_errors=3)
+        assert collector.error_count == 3
+        assert collector.limit_reached
+        assert collector.suppressed_count == 47
+        assert collector.report().splitlines()[-1] == (
+            "note: error limit (3) reached; 47 further errors suppressed"
+        )
+
+    def test_suppressed_counts_trailing_block_errors(self):
+        # Unterminated blocks are reported after the line loop; they must
+        # still be accounted for once the limit was already reached.
+        source = "".join(f"if (a > {i}):\n" for i in range(5))
+        collector = ExtendedDSLParser().validate(source, max_errors=2)
+        assert collector.error_count == 2
+        assert collector.limit_reached
+        assert collector.suppressed_count == 3
+
+
+# ---------------------------------------------------------------------------
+# F7 regression: CRLF source-line consistency
+# ---------------------------------------------------------------------------
+
+class TestCrlfSourceLineConsistency:
+    def test_strict_and_collector_agree_on_crlf_source_line(self):
+        source = "a = retrun(b, 1)\r\n"
+        with pytest.raises(DSLSyntaxError) as excinfo:
+            DSLParser().parse(source, filename="crlf.dsl")
+        strict_line = excinfo.value.source_line
+        assert strict_line == "a = retrun(b, 1)"
+
+        collector = rich_errors(DSLParser(), source, "crlf.dsl")
+        assert collector.errors[0].source_line == strict_line
+
+    def test_extended_parser_normalizes_crlf(self):
+        source = "if (a > b):\r\n  c = retrun(a)\r\nendif\r\n"
+        collector = rich_errors(
+            ExtendedDSLParser(), source, "crlf_ext.dsl",
+        )
+        assert collector.error_count == 1
+        assert collector.errors[0].source_line == "  c = retrun(a)"
+        assert all(
+            "\r" not in error.source_line for error in collector.errors
+        )
+
+    def test_crlf_valid_input_parses_cleanly(self):
+        source = "c = add(a, b)\r\nreturn c\r\n"
+        collector = rich_errors(DSLParser(), source, "crlf_ok.dsl")
+        assert collector.error_count == 0
+
+
+# ---------------------------------------------------------------------------
 # Regression: legal DSL produces zero diagnostics and unchanged IR
 # ---------------------------------------------------------------------------
 
@@ -497,6 +646,21 @@ class TestCompilerIntegration:
         assert result.success is False
         assert result.errors == [str(rich)]
         assert result.diagnostics == [rich]
+        assert not out.exists()
+
+    def test_compiler_surfaces_rich_error_when_validator_misses(
+        self, tmp_path,
+    ):
+        # 'add(mul(b, c))' passes the validator (inner comma splits into two
+        # positional args), so the rich parser must report E205 for real.
+        src = tmp_path / "nested.dsl"
+        src.write_text("a = add(mul(b, c))\n")
+        out = tmp_path / "out.s"
+        result = CompilerDriver(CompilerConfig()).compile(str(src), str(out))
+
+        assert result.success is False
+        assert len(result.errors) == 1
+        assert "error[E205]" in result.errors[0]
         assert not out.exists()
 
     def test_compiler_compiles_for_loop(self, tmp_path):
