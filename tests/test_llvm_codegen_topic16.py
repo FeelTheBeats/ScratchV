@@ -16,12 +16,12 @@ from pathlib import Path
 import pytest
 
 from scratchv.backend.llvm_codegen import (
-    LLVMCodegen, LLVMCodegenError, SSANamer,
+    LLVMCodegen, LLVMCodegenError, SSANamer, _float_literal,
 )
 from scratchv.frontend.dsl_extended import ExtendedDSLParser
 from scratchv.frontend.dsl_parser import DSLParser
 from scratchv.ir.builder import IRBuilder
-from scratchv.ir.types import DataType
+from scratchv.ir.types import DataType, OpCode
 
 LLVM_AS = shutil.which("llvm-as")
 LLI = shutil.which("lli")
@@ -402,13 +402,10 @@ def test_asm_dsl_nested_for(tmp_path):
 
 
 @requires_asm
-def test_asm_extended_if_while(tmp_path):
+def test_asm_extended_if_only(tmp_path):
     source = (
         "i = add(i, 1.0)\n"
-        "while (i < 10):\n"
-        "i = add(i, 1.0)\n"
-        "endwhile\n"
-        "if (i == 10):\n"
+        "if (i == 10.0):\n"
         "i = add(i, 1.0)\n"
         "else:\n"
         "i = sub(i, 1.0)\n"
@@ -416,11 +413,49 @@ def test_asm_extended_if_while(tmp_path):
         "return i"
     )
     program = ExtendedDSLParser().parse(source)
-    result = _assemble(LLVMCodegen(program).emit(), tmp_path)
-    assert result.returncode == 0, result.stderr
     ir = LLVMCodegen(program).emit()
+    result = _assemble(ir, tmp_path)
+    assert result.returncode == 0, result.stderr
     assert "fcmp oeq float" in ir
+
+
+@requires_asm
+def test_asm_extended_while_with_return(tmp_path):
+    source = (
+        "acc = add(acc, 1.0)\n"
+        "while (i < 10.0):\n"
+        "acc = add(acc, 1.0)\n"
+        "return acc\n"
+        "endwhile\n"
+        "return acc"
+    )
+    program = ExtendedDSLParser().parse(source)
+    ir = LLVMCodegen(program).emit()
+    result = _assemble(ir, tmp_path)
+    assert result.returncode == 0, result.stderr
     assert "fcmp olt float" in ir
+
+
+@requires_asm
+def test_while_reassigned_condition_raises():
+    """A while loop whose condition cannot change must fail loudly.
+
+    DSL variables have static SSA semantics: ``i = add(i, 1.0)`` defines a
+    new value and never updates the slot the header reads, so the loop would
+    spin forever. Regression for review F1 (while deadlock).
+    """
+    source = (
+        "i = add(0.0, 0.0)\n"
+        "s = add(0.0, 0.0)\n"
+        "while (i < 10.0):\n"
+        "s = add(s, i)\n"
+        "i = add(i, 1.0)\n"
+        "endwhile\n"
+        "return s"
+    )
+    program = ExtendedDSLParser().parse(source)
+    with pytest.raises(LLVMCodegenError, match="can never exit"):
+        LLVMCodegen(program).emit()
 
 
 @requires_asm
@@ -524,6 +559,62 @@ def _check_numeric(program, main_ir: str, tmp_path):
     ir = LLVMCodegen(program).emit() + "\n" + main_ir
     result = _run(ir, tmp_path)
     assert result.returncode == 0, result.stderr
+
+
+def _kernel_call(ir: str, name: str = "kernel") -> tuple[str, str]:
+    """Build a call expression matching the emitted signature."""
+    m = re.search(rf"define (\S+) @{name}\(([^)]*)\)", ir)
+    assert m, f"definition of @{name} not found"
+    ret_ty = m.group(1)
+    params = [p.strip() for p in m.group(2).split(",") if p.strip()]
+    args = ", ".join(f"{p.rsplit(' ', 1)[0]} 0.0" for p in params)
+    return f"call {ret_ty} @{name}({args})", ret_ty
+
+
+def _rename_kernel(program):
+    program.functions[0].name = "kernel"
+    return program
+
+
+def _compare_array(reg: str, values, eps: str | None = None) -> str:
+    """Emit per-element equality (or tolerance) checks; return IR lines."""
+    lines: list[str] = []
+    conds: list[str] = []
+    for i, expected in enumerate(values):
+        if i == 0:
+            ptr = f"%{reg}"
+        else:
+            ptr = f"%{reg}{i}"
+            lines.append(
+                f"  {ptr} = getelementptr float, float* %{reg}, i32 {i}"
+            )
+        lines.append(f"  %v{i} = load float, float* {ptr}")
+        if eps is None:
+            lines.append(f"  %c{i} = fcmp oeq float %v{i}, {expected}")
+        else:
+            expected_lit = _float_literal(float(expected))
+            lines.append(f"  %d{i} = fsub float %v{i}, {expected_lit}")
+            lines.append(f"  %ad{i} = fcmp ogt float %d{i}, 0.0")
+            lines.append(f"  %nd{i} = fneg float %d{i}")
+            lines.append(
+                f"  %aabs{i} = select i1 %ad{i}, float %d{i}, float %nd{i}"
+            )
+            lines.append(f"  %c{i} = fcmp olt float %aabs{i}, "
+                         f"{_float_literal(float(eps))}")
+        conds.append(f"%c{i}")
+    acc = conds[0]
+    for i, cond in enumerate(conds[1:], start=1):
+        lines.append(f"  %t{i} = and i1 {acc}, {cond}")
+        acc = f"%t{i}"
+    lines.append(f"  %rc = select i1 {acc}, i32 0, i32 1")
+    lines.append("  ret i32 %rc")
+    return "\n".join(lines)
+
+
+def _scalar_program(program, expected: str) -> str:
+    ir = LLVMCodegen(program).emit()
+    call_expr, _ = _kernel_call(ir)
+    return _scalar_main(call_expr, expected)
 
 
 @requires_lli
@@ -687,3 +778,523 @@ def test_lli_softmax_single(tmp_path):
     }
     """ % body)
     _check_numeric(_build_softmax(1), main, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# F1 regression: DSL variable semantics are static SSA
+# (design doc "known limitations" — values below are the documented result)
+# ---------------------------------------------------------------------------
+
+@requires_lli
+def test_lli_dsl_nested_for_static_ssa_value(tmp_path):
+    """DSL accumulation is unsupported: each write is a fresh SSA value.
+
+    ``s`` inside the loop always reads the pre-loop value, so the result is
+    the last inner iteration's ``s + i`` = 2.0, not 9.0. The correct
+    accumulator form is the IRBuilder alloca/load/store program covered by
+    ``test_lli_nested_for_accumulator``.
+    """
+    program = _rename_kernel(DSLParser().parse(
+        "s = add(s, 0.0)\n"
+        "for i = 0, 3\n"
+        "for j = 0, 3\n"
+        "s = add(s, i)\n"
+        "endfor\n"
+        "endfor\n"
+        "return s"
+    ))
+    _check_numeric(program, _scalar_program(program, "2.0"), tmp_path)
+
+
+@requires_lli
+def test_lli_dsl_loop_carried_static_ssa_value(tmp_path):
+    """Loop-carried ``x`` never updates: 3.0 + 1.0 = 4.0, not 5.0."""
+    program = _rename_kernel(DSLParser().parse(
+        "x = add(3.0, 0.0)\n"
+        "for i = 0, 2\n"
+        "x = add(x, 1.0)\n"
+        "endfor\n"
+        "return x"
+    ))
+    _check_numeric(program, _scalar_program(program, "4.0"), tmp_path)
+
+
+def test_dsl_if_else_merge_reads_last_parsed_branch():
+    """If/else merge loads the slot of the last *parsed* assignment.
+
+    The DSL has no phi/variable identity, so the read after ``endif`` always
+    resolves to the ``else`` assignment even when the ``then`` branch ran
+    (the else slot is then uninitialized → undefined value). Locking the
+    structural defect (regression for review F1, if/else merge).
+    """
+    program = ExtendedDSLParser().parse(
+        "y = add(0.0, 0.0)\n"
+        "if (1.0 < 2.0):\n"
+        "y = add(1.0, 0.0)\n"
+        "else:\n"
+        "y = add(2.0, 0.0)\n"
+        "endif\n"
+        "return y"
+    )
+    ir = LLVMCodegen(program).emit()
+    blocks: dict[str, str] = {}
+    current = "entry"
+    for line in ir.splitlines():
+        if re.match(r"^\w+:$", line.strip()):
+            current = line.strip()[:-1]
+            blocks[current] = ""
+        blocks.setdefault(current, "")
+        blocks[current] += line + "\n"
+    else_block = next(name for name in blocks if name.startswith("if_else"))
+    merge_block = next(
+        name for name, body in blocks.items() if re.search(r"ret float", body)
+    )
+    merge_slot = re.search(
+        r"load float, float\* (%\S+)\s*\n\s*ret float", blocks[merge_block]
+    ).group(1)
+    else_slot = re.findall(
+        r"store float %\S+, float\* (%\S+)", blocks[else_block]
+    )[-1]
+    assert merge_slot == else_slot
+    then_block = next(name for name in blocks if name.startswith("if_then"))
+    then_slot = re.findall(
+        r"store float %\S+, float\* (%\S+)", blocks[then_block]
+    )[-1]
+    assert then_slot != merge_slot
+
+
+# ---------------------------------------------------------------------------
+# F2 regression: shaped destinations must lower elementwise or fail loudly
+# ---------------------------------------------------------------------------
+
+def _unary_tensor_program(op: str, values=(4,)):
+    b = IRBuilder()
+    f = b.new_function("kernel")
+    b.new_block("entry")
+    x = _param(b, f, "x", values)
+    result = getattr(b, op)(x)
+    result.shape = tuple(values)
+    b.ret(result)
+    return b.program
+
+
+def _binary_tensor_program(op: str, values=(4,)):
+    b = IRBuilder()
+    f = b.new_function("kernel")
+    b.new_block("entry")
+    x = _param(b, f, "x", values)
+    y = _param(b, f, "y", values)
+    result = getattr(b, op)(x, y)
+    result.shape = tuple(values)
+    b.ret(result)
+    return b.program
+
+
+@requires_asm
+@pytest.mark.parametrize("op", ["add", "sub", "mul", "div"])
+def test_asm_binary_ops_with_tensor_dest(op, tmp_path):
+    program = _binary_tensor_program(op)
+    ir = LLVMCodegen(program).emit()
+    assert "define float* @kernel(float* %x, float* %y)" in ir
+    result = _assemble(ir, tmp_path)
+    assert result.returncode == 0, result.stderr
+
+
+@requires_asm
+@pytest.mark.parametrize("op", ["relu", "exp", "neg", "gelu", "sigmoid"])
+def test_asm_unary_ops_with_tensor_dest(op, tmp_path):
+    program = _unary_tensor_program(op)
+    ir = LLVMCodegen(program).emit()
+    assert "define float* @kernel(float* %x)" in ir
+    assert "ret float* %" in ir
+    result = _assemble(ir, tmp_path)
+    assert result.returncode == 0, result.stderr
+
+
+@requires_lli
+def test_lli_tensor_dest_relu(tmp_path):
+    program = _unary_tensor_program("relu")
+    main = textwrap.dedent("""\
+    define i32 @main() {
+    entry:
+    %s
+      %%out = call float* @kernel(float* %%arr)
+    %s
+    }
+    """ % (_store_array("arr", ["1.0", "-2.0", "3.0", "-4.0"]),
+           _compare_array("out", ["1.0", "0.0", "3.0", "0.0"])))
+    _check_numeric(program, main, tmp_path)
+
+
+@requires_lli
+def test_lli_tensor_dest_add(tmp_path):
+    program = _binary_tensor_program("add")
+    main = textwrap.dedent("""\
+    define i32 @main() {
+    entry:
+    %s
+    %s
+      %%out = call float* @kernel(float* %%x, float* %%y)
+    %s
+    }
+    """ % (_store_array("x", ["1.0", "2.0", "3.0"]),
+           _store_array("y", ["10.0", "20.0", "30.0"]),
+           _compare_array("out", ["11.0", "22.0", "33.0"])))
+    _check_numeric(program, main, tmp_path)
+
+
+@requires_lli
+def test_lli_tensor_dest_gelu_and_neg(tmp_path):
+    program = _unary_tensor_program("neg")
+    main = textwrap.dedent("""\
+    define i32 @main() {
+    entry:
+    %s
+      %%out = call float* @kernel(float* %%arr)
+    %s
+    }
+    """ % (_store_array("arr", ["1.5", "-2.5"]),
+           _compare_array("out", ["-1.5", "2.5"])))
+    _check_numeric(program, main, tmp_path)
+
+    program = _unary_tensor_program("gelu")
+    main = textwrap.dedent("""\
+    define i32 @main() {
+    entry:
+    %s
+      %%out = call float* @kernel(float* %%arr)
+    %s
+    }
+    """ % (_store_array("arr", ["0.0", "0.0", "0.0"]),
+           _compare_array("out", ["0.0", "0.0", "0.0"])))
+    _check_numeric(program, main, tmp_path)
+
+
+@requires_asm
+def test_tensor_dest_mismatched_operands_raise():
+    b = IRBuilder()
+    f = b.new_function("kernel")
+    b.new_block("entry")
+    x = _param(b, f, "x", (4,))
+    y = _param(b, f, "y", (3,))
+    result = b.add(x, y)
+    result.shape = (4,)
+    b.ret(result)
+    with pytest.raises(LLVMCodegenError, match="destination needs"):
+        LLVMCodegen(b.program).emit()
+
+
+# ---------------------------------------------------------------------------
+# F3 regression: scalar operands cannot feed multi-element tensor loops
+# ---------------------------------------------------------------------------
+
+def test_dot_scalar_operands_with_length_raise():
+    program = DSLParser().parse("y = dot(a, b, len:4)\nreturn y")
+    with pytest.raises(LLVMCodegenError, match="scalar operand"):
+        LLVMCodegen(program).emit()
+
+
+def test_matmul_scalar_operands_with_dims_raise():
+    b = IRBuilder()
+    f = b.new_function("kernel")
+    b.new_block("entry")
+    a = _param(b, f, "a")
+    c = _param(b, f, "b")
+    b.ret(b.matmul(a, c, 2, 2, 2))
+    with pytest.raises(LLVMCodegenError, match="scalar operand"):
+        LLVMCodegen(b.program).emit()
+
+
+def test_gemm_scalar_operands_with_dims_raise():
+    b = IRBuilder()
+    f = b.new_function("kernel")
+    b.new_block("entry")
+    a = _param(b, f, "a")
+    w = _param(b, f, "w")
+    bias = _param(b, f, "bias")
+    dest = b.make_value("gemm_out")
+    b._emit(OpCode.GEMM, dest, [a, w, bias], M=2, K=2, N=2)
+    b.ret(dest)
+    with pytest.raises(LLVMCodegenError, match="scalar operand"):
+        LLVMCodegen(b.program).emit()
+
+
+@requires_lli
+def test_lli_dot_scalar_one_element_degenerate(tmp_path):
+    """needed == 1 still allows the documented 1-element degeneration."""
+    _check_numeric(
+        _build_matmul_scalar(),
+        _scalar_main("call float @kernel(float 2.0, float 3.0)", "6.0"),
+        tmp_path,
+    )
+
+
+# ---------------------------------------------------------------------------
+# F4 regression: softmax must cover every row of a 2D+ input
+# ---------------------------------------------------------------------------
+
+@requires_lli
+def test_lli_softmax_2d_all_rows(tmp_path):
+    b = IRBuilder()
+    f = b.new_function("kernel")
+    b.new_block("entry")
+    x = _param(b, f, "x", (2, 2))
+    res = b.softmax(x)
+    res.shape = (2, 2)
+    b.ret(res)
+    main = textwrap.dedent("""\
+    define i32 @main() {
+    entry:
+    %s
+      %%out = call float* @kernel(float* %%arr)
+    %s
+    }
+    """ % (_store_array("arr", ["0.0"] * 4),
+           _compare_array("out", ["0.5"] * 4)))
+    _check_numeric(b.program, main, tmp_path)
+
+
+@requires_asm
+def test_softmax_2d_has_row_loop_and_full_buffer(tmp_path):
+    b = IRBuilder()
+    f = b.new_function("kernel")
+    b.new_block("entry")
+    x = _param(b, f, "x", (2, 3))
+    res = b.softmax(x)
+    res.shape = (2, 3)
+    b.ret(res)
+    ir = LLVMCodegen(b.program).emit()
+    assert "alloca float, i32 6" in ir
+    assert "sm_row_hdr" in ir
+    result = _assemble(ir, tmp_path)
+    assert result.returncode == 0, result.stderr
+
+
+def test_softmax_non_last_axis_raises():
+    b = IRBuilder()
+    f = b.new_function("kernel")
+    b.new_block("entry")
+    x = _param(b, f, "x", (4, 4))
+    b.ret(b.softmax(x, axis=0))
+    with pytest.raises(LLVMCodegenError, match="only axis=-1"):
+        LLVMCodegen(b.program).emit()
+
+
+@requires_lli
+def test_lli_softmax_three_values_tolerance(tmp_path):
+    body = _store_array("x", ["1.0", "2.0", "3.0"])
+    main = textwrap.dedent("""\
+    define i32 @main() {
+    entry:
+    %s
+      %%out = call float* @kernel(float* %%x)
+    %s
+    }
+    """ % (body, _compare_array(
+        "out",
+        ["0.09003057", "0.24472847", "0.66524096"],
+        eps="0.000001",
+    )))
+    _check_numeric(_build_softmax(3), main, tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# F5 regression: mixed void/value returns must fail loudly
+# ---------------------------------------------------------------------------
+
+def test_mixed_return_types_raise_dsl():
+    program = DSLParser().parse("return x\ni = add(i, 1.0)")
+    with pytest.raises(LLVMCodegenError, match="mixed with value return"):
+        LLVMCodegen(program).emit()
+
+
+def test_mixed_return_types_raise_extended():
+    program = ExtendedDSLParser().parse(
+        "i = add(i, 1.0)\nif (i < 3.0):\nreturn i\nendif\n"
+    )
+    with pytest.raises(LLVMCodegenError, match="mixed with value return"):
+        LLVMCodegen(program).emit()
+
+
+@requires_asm
+def test_uniform_early_return_assembles(tmp_path):
+    program = ExtendedDSLParser().parse(
+        "i = add(i, 1.0)\nif (i < 3.0):\nreturn i\nendif\nreturn 0.0"
+    )
+    ir = LLVMCodegen(program).emit()
+    assert "ret float" in ir
+    assert "ret void" not in ir
+    result = _assemble(ir, tmp_path)
+    assert result.returncode == 0, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# F7 regression: unlowered opcodes fail loudly
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("opcode", [OpCode.TRANSPOSE, OpCode.CONCAT])
+def test_unlowered_opcode_raises(opcode):
+    b = IRBuilder()
+    b.new_function("kernel")
+    b.new_block("entry")
+    a = b.make_value("a")
+    a.shape = (2, 2)
+    dest = b.make_value("unlowered")
+    b._emit(opcode, dest, [a])
+    b.ret(dest)
+    with pytest.raises(LLVMCodegenError, match="not lowered"):
+        LLVMCodegen(b.program).emit()
+
+
+# ---------------------------------------------------------------------------
+# F9 regression: broader lli numeric matrix
+# ---------------------------------------------------------------------------
+
+@requires_lli
+def test_lli_conv_padding_stride_nonuniform(tmp_path):
+    shape = (1, 1, 6, 6)
+    b = IRBuilder()
+    f = b.new_function("kernel")
+    b.new_block("entry")
+    x = _param(b, f, "x", shape)
+    w = _param(b, f, "w", (1, 1, 2, 2))
+    bias = _param(b, f, "bias", (1,))
+    res = b.conv(x, w, bias, 1, 2, 2, 1)
+    res.shape = (1, 1, 4, 4)
+    b.ret(res)
+    values = [float(i + 1) for i in range(36)]
+    expected = []
+    for oh in range(4):
+        for ow in range(4):
+            acc = 0.5
+            for kh in range(2):
+                for kw in range(2):
+                    ih = oh * 2 + kh - 1
+                    iw = ow * 2 + kw - 1
+                    if 0 <= ih < 6 and 0 <= iw < 6 and kh == kw:
+                        acc += values[ih * 6 + iw]
+            expected.append(repr(acc))
+    main = textwrap.dedent("""\
+    define i32 @main() {
+    entry:
+    %s
+    %s
+    %s
+      %%out = call float* @kernel(float* %%x, float* %%w, float* %%bias)
+    %s
+    }
+    """ % (_store_array("x", [str(v) for v in values]),
+           _store_array("w", ["1.0", "0.0", "0.0", "1.0"]),
+           _store_array("bias", ["0.5"]),
+           _compare_array("out", expected)))
+    _check_numeric(b.program, main, tmp_path)
+
+
+@requires_lli
+def test_lli_gemm_trans_b_nonsquare(tmp_path):
+    b = IRBuilder()
+    f = b.new_function("kernel")
+    b.new_block("entry")
+    a = _param(b, f, "a", (2, 2))
+    w = _param(b, f, "w", (3, 2))
+    bias = _param(b, f, "bias", (3,))
+    res = b.gemm(a, w, bias, trans_b=True)
+    res.shape = (2, 3)
+    b.ret(res)
+    main = textwrap.dedent("""\
+    define i32 @main() {
+    entry:
+    %s
+    %s
+    %s
+      %%out = call float* @kernel(float* %%a, float* %%w, float* %%bias)
+    %s
+    }
+    """ % (_store_array("a", ["1.0", "2.0", "3.0", "4.0"]),
+           _store_array("w", ["1.0", "0.0", "0.0", "1.0", "1.0", "1.0"]),
+           _store_array("bias", ["0.0", "1.0", "2.0"]),
+           _compare_array("out", ["1.0", "3.0", "5.0", "3.0", "5.0", "9.0"])))
+    _check_numeric(b.program, main, tmp_path)
+
+
+@requires_lli
+def test_lli_matmul_nonsquare(tmp_path):
+    b = IRBuilder()
+    f = b.new_function("kernel")
+    b.new_block("entry")
+    a = _param(b, f, "a", (2, 3))
+    c = _param(b, f, "b", (3, 2))
+    res = b.matmul(a, c, 2, 2, 3)
+    res.shape = (2, 2)
+    b.ret(res)
+    main = textwrap.dedent("""\
+    define i32 @main() {
+    entry:
+    %s
+    %s
+      %%out = call float* @kernel(float* %%a, float* %%b)
+    %s
+    }
+    """ % (_store_array("a", ["1.0", "2.0", "3.0", "4.0", "5.0", "6.0"]),
+           _store_array("b", ["1.0", "0.0", "0.0", "1.0", "1.0", "1.0"]),
+           _compare_array("out", ["4.0", "5.0", "10.0", "11.0"])))
+    _check_numeric(b.program, main, tmp_path)
+
+
+@requires_lli
+def test_lli_maxpool_stride_two_all_elements(tmp_path):
+    b = IRBuilder()
+    f = b.new_function("kernel")
+    b.new_block("entry")
+    x = _param(b, f, "x", (1, 4, 4))
+    res = b.maxpool(x, 2, 2)
+    res.shape = (1, 2, 2)
+    b.ret(res)
+    main = textwrap.dedent("""\
+    define i32 @main() {
+    entry:
+    %s
+      %%out = call float* @kernel(float* %%arr)
+    %s
+    }
+    """ % (_store_array("arr", [str(float(i + 1)) for i in range(16)]),
+           _compare_array("out", ["6.0", "8.0", "14.0", "16.0"])))
+    _check_numeric(b.program, main, tmp_path)
+
+
+@requires_lli
+def test_lli_for_step_two(tmp_path):
+    b = IRBuilder()
+    b.new_function("kernel")
+    b.new_block("entry")
+    acc = b.alloca(1)
+    b.store(acc, b.load_const(0.0))
+    iv = b.for_loop(0, 6, 2)
+    current = b.load(acc)
+    b.store(acc, b.add(current, iv))
+    b.endfor()
+    b.ret(b.load(acc))
+    main = textwrap.dedent("""\
+    define i32 @main() {
+    entry:
+      %r = call float @kernel()
+      %ok = fcmp oeq float %r, 6.0
+      %rc = select i1 %ok, i32 0, i32 1
+      ret i32 %rc
+    }
+    """)
+    _check_numeric(b.program, main, tmp_path)
+
+
+def test_gemm_trans_a_raises():
+    b = IRBuilder()
+    f = b.new_function("kernel")
+    b.new_block("entry")
+    a = _param(b, f, "a", (2, 2))
+    w = _param(b, f, "w", (2, 2))
+    bias = _param(b, f, "bias", (2,))
+    res = b.gemm(a, w, bias, trans_a=True)
+    res.shape = (2, 2)
+    b.ret(res)
+    with pytest.raises(LLVMCodegenError, match="trans_a"):
+        LLVMCodegen(b.program).emit()
