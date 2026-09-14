@@ -15,7 +15,7 @@ import argparse
 import sys
 
 from scratchv.compiler import CompilerConfig, CompilerDriver, CompileResult
-from scratchv.utils.logger import shutdown
+from scratchv.utils.logger import LogFileError, shutdown
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -76,7 +76,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--log-file", default=None, metavar="FILE",
-        help="Write plain-text DEBUG log to FILE (implies logging at INFO+)",
+        help=("Write plain-text DEBUG log to FILE (implies logging at INFO+); "
+              "must differ from the input/output paths"),
     )
     parser.add_argument(
         "--verify-ir", action="store_true",
@@ -253,6 +254,11 @@ def main(argv: list[str] | None = None) -> int:
             output_path=args.output,
             dsl_source=args.dsl if hasattr(args, 'dsl') else None,
         )
+    except LogFileError as exc:
+        # User-facing log-file problem: report it the same way for DSL and
+        # ONNX inputs instead of a misleading internal error/traceback.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     except Exception as exc:
         if not use_dsl:
             raise

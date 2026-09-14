@@ -106,6 +106,14 @@ _console_handler: Optional[logging.Handler] = None
 _file_handler: Optional[logging.Handler] = None
 
 
+class LogFileError(OSError):
+    """Raised when the configured log file cannot be opened or is unsafe.
+
+    Subclasses :class:`OSError` so callers that already guard file I/O
+    keep working; the CLI reports it as a user-facing error (exit code 2).
+    """
+
+
 def init_logger(
     level: str = "INFO",
     log_file: str | None = None,
@@ -118,11 +126,16 @@ def init_logger(
 
     Args:
         level: Log level string (DEBUG, INFO, WARNING, ERROR, CRITICAL).
+            Applies to the console handler.  When ``log_file`` is given the
+            root logger is pinned to DEBUG so the file stays a complete
+            record.
         log_file: Optional path to write log output to (plain text, no color).
         use_color: Enable ANSI color output on console.
 
     Raises:
         ValueError: If level is not a valid log level string.
+        LogFileError: If the log file cannot be opened.  Any partially
+            initialized state is torn down before the error propagates.
     """
     global _root_logger, _initialized, _config, _console_handler, _file_handler
 
@@ -141,9 +154,12 @@ def init_logger(
         "use_color": use_color,
     }
 
-    # Configure root logger
+    # Configure root logger.  With a file handler the root must let DEBUG
+    # records through, otherwise the handler-level DEBUG would be filtered
+    # out before reaching the file (F1); the console handler still carries
+    # the user-visible level.
     _root_logger = logging.getLogger("scratchv")
-    _root_logger.setLevel(numeric_level)
+    _root_logger.setLevel(logging.DEBUG if log_file else numeric_level)
 
     # Console handler
     console_handler = logging.StreamHandler(sys.stderr)
@@ -155,9 +171,18 @@ def init_logger(
     # File handler
     _file_handler = None
     if log_file:
-        file_handler = logging.FileHandler(
-            log_file, mode="w", encoding="utf-8",
-        )
+        try:
+            file_handler = logging.FileHandler(
+                log_file, mode="w", encoding="utf-8",
+            )
+        except OSError as exc:
+            # Roll back the half-built logger: close the console handler and
+            # reset global state so callers never observe a broken logger.
+            shutdown()
+            reason = exc.strerror or str(exc)
+            raise LogFileError(
+                f"cannot open log file '{log_file}': {reason}"
+            ) from exc
         file_handler.setLevel(logging.DEBUG)  # Always write DEBUG to file
         file_handler.setFormatter(_PlainFormatter())
         _root_logger.addHandler(file_handler)
@@ -188,8 +213,21 @@ def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)
 
 
+def is_initialized() -> bool:
+    """Return whether ``init_logger()`` is currently active.
+
+    ``False`` after ``shutdown()``; callers can use this to decide whether
+    the logging system must be rebuilt with their configuration.
+    """
+    return _initialized
+
+
 def set_level(level: str) -> None:
-    """Change the log level of the root scratchv logger at runtime.
+    """Change the console log level of the root scratchv logger at runtime.
+
+    The file handler always stays at DEBUG, and while a file handler is
+    attached the root logger stays at DEBUG as well so records reach the
+    file; the runtime level is enforced by the console handler (F1).
 
     Args:
         level: New log level string.
@@ -204,7 +242,10 @@ def set_level(level: str) -> None:
     numeric_level = getattr(logging, level.upper(), None)
     if not isinstance(numeric_level, int):
         raise ValueError(f"Invalid log level: {level}")
-    _root_logger.setLevel(numeric_level)
+    if _file_handler is not None:
+        _root_logger.setLevel(logging.DEBUG)
+    else:
+        _root_logger.setLevel(numeric_level)
     # Update the console handler only; the file handler always stays at
     # DEBUG so the log file remains a complete record (D5).
     if _console_handler is not None:
@@ -215,14 +256,19 @@ def set_level(level: str) -> None:
 def shutdown() -> None:
     """Flush and close all logging handlers and reset global state.
 
-    Safe to call repeatedly; after shutdown the logging system can be
-    re-initialised with ``init_logger()``.
+    Safe to call repeatedly, and robust against streams that were already
+    closed externally (e.g. pytest capture teardown): failures are
+    swallowed so the state reset below always runs.  After shutdown the
+    logging system can be re-initialised with ``init_logger()``.
     """
     global _root_logger, _initialized, _config, _console_handler, _file_handler
     if _root_logger is not None:
         for handler in list(_root_logger.handlers):
-            handler.flush()
-            handler.close()
+            try:
+                handler.flush()
+                handler.close()
+            except Exception:
+                pass
             _root_logger.removeHandler(handler)
     _root_logger = None
     _initialized = False

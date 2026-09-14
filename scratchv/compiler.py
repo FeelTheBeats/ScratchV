@@ -20,6 +20,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import os
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -27,12 +28,22 @@ from typing import Any, Optional
 
 from scratchv.pass_interface import CompilerPass, PassResult
 from scratchv.utils.logger import (
+    LogFileError,
     get_logger,
     init_logger,
+    is_initialized,
     log_phase,
     log_progress,
     log_step,
 )
+
+
+def _one_line(text: str) -> str:
+    """Collapse a possibly multi-line error message into one log line (R9)."""
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()
+    return text
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -146,7 +157,8 @@ class PassManager:
                 result = p.run(data)
             except Exception as exc:
                 if self._log is not None:
-                    self._log.error("pass '%s' failed: %s", p.name, exc)
+                    self._log.error("pass '%s' failed: %s", p.name, exc,
+                                    exc_info=True)
                 return PassResult(
                     data=None,
                     changes=total_changes,
@@ -293,8 +305,29 @@ class CompilerDriver:
         errors: list[str] = []
         warnings: list[str] = []
 
-        # Initialise structured logging once per driver instance.
-        if self.config.use_logger and self._log is None:
+        # Resolve output path first so the log file can be validated against
+        # both the input and the output path.
+        if output_path is None:
+            output_path = "output.ll" if self.config.backend == "llvm" else "output.s"
+
+        # Refuse a log file that would clobber the input or output file:
+        # the FileHandler opens with mode="w" before parsing would run (F3).
+        if self.config.use_logger and self.config.log_file:
+            log_real = os.path.realpath(self.config.log_file)
+            for role, path in (("input", input_path), ("output", output_path)):
+                if path and os.path.realpath(path) == log_real:
+                    raise LogFileError(
+                        f"log file '{self.config.log_file}' would overwrite "
+                        f"{role} file '{path}'"
+                    )
+
+        # Initialise structured logging once per driver instance; rebuild it
+        # if a previous shutdown() released the handlers so the configured
+        # level/file/color are honoured instead of silently reverting to
+        # defaults (F5).
+        if self.config.use_logger and (
+            self._log is None or not is_initialized()
+        ):
             init_logger(level=self.config.log_level,
                         log_file=self.config.log_file,
                         use_color=self.config.log_color)
@@ -302,10 +335,6 @@ class CompilerDriver:
             self._log.debug("config: backend=%s optimize=%s reg_alloc=%s",
                             self.config.backend, self.config.optimize_level,
                             self.config.reg_alloc)
-
-        # Resolve output path
-        if output_path is None:
-            output_path = "output.ll" if self.config.backend == "llvm" else "output.s"
 
         use_dsl = (
             dsl_source is not None
@@ -324,6 +353,12 @@ class CompilerDriver:
             )
             if collector.has_errors:
                 diagnostics = collector.errors
+                if self._log is not None:
+                    first = _one_line(str(diagnostics[0])) if diagnostics else "<unknown>"
+                    self._log.error(
+                        "compilation failed: %d error(s); first: %s",
+                        len(diagnostics), first,
+                    )
                 return CompileResult(
                     success=False,
                     errors=[str(error) for error in diagnostics],
@@ -342,6 +377,7 @@ class CompilerDriver:
         except Exception as e:
             if self._log is not None:
                 self._log.debug("parse exception", exc_info=True)
+                self._log.error("compilation failed: %s", _one_line(str(e)))
             if use_dsl:
                 from scratchv.frontend.dsl_errors import DSLSyntaxError
                 if isinstance(e, DSLSyntaxError):
@@ -370,6 +406,14 @@ class CompilerDriver:
             with self._phase("compiler.optimize", "Running optimization passes"):
                 opt_result = self._run_optimizations(program)
             opt_message = opt_result.message
+            if opt_result.data is None and self._log is not None:
+                # A pass failed or stopped the pipeline (E2: control flow is
+                # unchanged), so flag that codegen continues on partially
+                # optimized IR instead of letting "succeeded" mislead.
+                self._log.warning(
+                    "optimization did not complete; continuing with "
+                    "partially optimized IR: %s", opt_result.message,
+                )
 
         ir_dump_after = ""
         if self.config.dump_ir:
@@ -395,6 +439,7 @@ class CompilerDriver:
         except Exception as e:
             if self._log is not None:
                 self._log.debug("codegen exception", exc_info=True)
+                self._log.error("compilation failed: %s", _one_line(str(e)))
             return CompileResult(
                 success=False, errors=[f"Codegen error: {e}"],
                 ir_dump=ir_dump,
