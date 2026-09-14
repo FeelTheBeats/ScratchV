@@ -651,7 +651,8 @@ llvm-as /tmp/out.ll -o /dev/null                 # 手工冒烟（cnn.onnx 输�
 
 | 风险 | 概率/影响 | 缓释 | 回退 |
 |------|-----------|------|------|
-| 标量 DSL 调用张量算子只有退化 1 元素语义（如 `dot(a,b,len:8)` 中 a/b 是标量） | 高/中 | 文档明确“degenerate 1-element tensor”；测试用 IRBuilder 显式 `shape` 构造真张量；不做语义欺骗 | 如评审要求完整向量语义，需扩 IR（超范围，另立课题） |
+| 标量操作数进入张量算子所需元素数 > 1（如 `dot(a,b,len:8)` 中 a/b 是标量） | 中/中 | 需求元素数 > 1 时抛 `LLVMCodegenError`（`_require_elements`），不再 spill 成 1 元素缓冲后越界读；needed==1 的退化仍支持 | 如评审要求完整向量语义，需扩 IR（超范围，另立课题） |
+| DSL 循环/分支变量为静态 SSA（无 phi）：累加不生效、while 条件不可变、if/else 合流未定义 | 高/高 | 文档 §5.7 锁定实际行为并补 `lli`/结构回归；while 不可能退出时 fail-loud；正确累加用 IRBuilder alloca/load/store | 前端变量降级为 alloca/load/store 属独立课题（评审 §4.1） |
 | ONNX 路径参数变 `float*`、返回 `float*` 改变模块形态 | 中/中 | `benchmarks` 仅断言非空；无其他测试依赖具体签名 | 保持标量签名 + 内部 spill，放弃指针优化（改回点在 `_value_type`） |
 | `_start_block` 自动补 `br` 改变 IR 文本，既有结构断言用例误判 | 中/低 | 同步更新 `tests/test_llvm_codegen.py` 中 `": " in ir` 类弱断言 | 保留旧的 `_emit_block` 分支作为开关（不推荐） |
 | `lli` 数值测试受 libm 符号/平台影响 | 中/低 | 张量用例零 libm；激活用例 `xfail(strict=False)` | 数值验证降级为“结构 + 常量折叠冒烟” |
@@ -699,11 +700,25 @@ llvm-as /tmp/out.ll -o /dev/null                 # 手工冒烟（cnn.onnx 输�
 ### 与本文档的偏差 / 未完成项
 
 - 标量变量统一使用 alloca + load/store（不再区分寄存器直出形态）。
-- DSL 嵌套 `for` 的数值断言只做结构 + 可汇编，未做 `lli` 数值。
+- DSL 嵌套 `for` 的数值断言在修复轮（2026-09-14 阶段 2）已补齐 `lli`：静态 SSA 语义下实际值为 2.0，设计文档 §5.7 与 `test_lli_dsl_nested_for_static_ssa_value` 锁定。
+- DSL `while` 条件变量重赋值被 `_check_unbounded_loops` fail-loud 拒绝（原实现会生成死循环）；`if/else` 合流读最后解析分支的行为由结构测试锁定。
 - 多元素 initializer 在无 `shape` 信息时退化为 1 元素。
 - `gemm trans_a=True` 明确抛错（不支持）。
+
+### 修复轮补丁要点（2026-09-14 阶段 2，评审 F1–F5/F7/F9）
+
+| 评审项 | 修复方式 | 代码位置 |
+|--------|----------|----------|
+| F1（P0） | 设计文档期望值修正 + 已知限制 §5.7；while 不可退出 fail-loud；nested-for/loop-carried/if-else-merge 回归锁定 | `_check_unbounded_loops` |
+| F2（P1） | shaped dest 的元素级算子改走逐元素 `_emit_map`（含标量/单元素广播），`_dest` 拒绝张量目标 | `_emit_map`、`_dest` |
+| F3（P1） | 张量算子按缓冲真实元素数校验，标量供多元素即抛错 | `_require_elements` |
+| F4（P1） | softmax 按 `prod(shape[:-1])` 行循环、缓冲 `prod(shape)`；仅支持 axis=-1 | `_emit_softmax` |
+| F5（P1） | 混合 `ret <value>`/`ret void` 与不一致返回类型 fail-loud | `_validate_return_types` |
+| F7（P2） | 无 handler 的 opcode（transpose/concat）抛 `LLVMCodegenError`，删除零值伪计算 | `_emit_unsupported` |
+| F9（P2） | 补 conv padding/stride、gemm trans_b 非方阵、matmul 非方阵、maxpool stride2、softmax 3 元素容差、for step=2、trans_a 负例等 `lli` 用例 | `tests/test_llvm_codegen_topic16.py` |
 
 ### 已知限制
 
 - `llvm-as` / `lli` 环境缺失时相关用例 skip，不得以 skip 充当通过。
 - ONNX 路径 `float*` 签名与返回类型变化仍按文档风险表处理；无其他调用方依赖具体签名。
+- DSL 循环/分支变量语义仍为静态 SSA（根因在 `dsl_parser.py:114` 的 `_vars` 前端，评审 §4.1 列为既有仓库缺陷）；本分支仅做守卫/降级与文档锁定，不实现变量身份。

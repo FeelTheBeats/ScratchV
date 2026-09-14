@@ -37,9 +37,10 @@ LLVM 代码生成后端负责把 ScratchV IR（`Program`/`Function`/`BasicBlock`
 
 #### 修复后期望能力
 
-- 任意由 `DSLParser`/`ExtendedDSLParser`/`ONNXParser` 产生的 IR，经 `LLVMCodegen.emit()` 输出后 `llvm-as` 全部通过。
+- 任意由 `DSLParser`/`ExtendedDSLParser`/`ONNXParser` 产生的、**被后端接受**的 IR，经 `LLVMCodegen.emit()` 输出后 `llvm-as` 全部通过；明确不支持或语义无法保证的输入（见 2.4.8 与 2.6）抛 `LLVMCodegenError` 而不是输出静默错误或非法 IR。
 - 8 个算子的 IR 具有与 standalone 路径一致的循环嵌套结构、GEP 地址计算、浮点 MAC，可被 `lli`/`opt` 进一步消费。
 - 每个 SSA 名字全函数唯一、每个标签唯一定义、每个基本块以终止指令结束。
+- **DSL 变量语义为静态 SSA**：DSL 前端每次赋值产生一个新的 IR `Value`（`dsl_parser.py:114` 的 `_vars[name] = result`），IR 无 phi；循环携带累加、`while` 条件变量重赋值、`if/else` 合流等跨迭代/跨分支的变量语义**不属于本课题范围**（见 §三 用例 2 与 §5.7）。
 
 ### 1.2 设计目标
 
@@ -135,6 +136,13 @@ LLVM 基本块要求：**每个块恰好一条终止指令（`ret`/`br`/`br i1`�
    - 比较谓词映射：`==→oeq/eq`、`!=→one/ne`、`<→olt/slt`、`<=→ole/sle`、`>→ogt/sgt`、`>=→oge/sge`。
 6. **禁止跨块裸值**：不生成 `phi`；所有跨块传递走 `alloca/load/store`（memory-based SSA），天然满足支配关系，也与 standalone 现有写法一致。
 7. **alloca 位置**：循环计数器、累加器、张量缓冲区等统一登记到函数入口 prologue（在第一个 IR 块发射前输出），避免运行时在循环内分配栈导致栈膨胀。
+8. **fail-loud 边界（禁止静默错误）**：下列输入不再输出静默错误或非法 IR，而是抛 `LLVMCodegenError`：
+   - 函数内 `ret <value>` 与 `ret void` 混用（`_validate_return_types`）；
+   - 无 handler 的 opcode（transpose/concat 等，`_emit_unsupported`）；
+   - `while` 循环条件操作数在循环体（可达区块、无 `ret`）内从未被定义——DSL 静态 SSA 下该循环不可能退出（`_check_unbounded_loops`）；
+   - 张量算子（dot/matmul/gemm/conv/maxpool/softmax）所需的元素数大于操作数实际元素数，或操作数为标量而所需元素数 > 1（`_require_elements`）；
+   - 元素级算子（add/sub/mul/div/neg/exp/relu/gelu/sigmoid）的目标带 shape 时按逐元素语义生成（`_emit_map`）；操作数与目标元素数不一致时抛错；
+   - softmax 非 `axis=-1` 输入（`_emit_softmax`）。
 
 ### 2.5 算子 IR 生成规范
 
@@ -235,16 +243,18 @@ for c ∈ [0,C):
 
 #### 2.5.6 softmax（axis=-1，数值稳定三趟）
 
-维度：`attrs["length"]` 或输入 `shape[-1]`，缺省 1。  
-循环嵌套：3 个顺序单层循环（max、sum-exp、div），均减最大值以保证稳定；分母在第三趟重算 `exp`，不额外开临时数组。
+维度：输入 `shape[-1]`（无 shape 时取 `attrs["length"]`，缺省 1）；rank>1 时按 `prod(shape[:-1])` 行逐行处理，输出缓冲大小为 `prod(shape)`。非 `axis=-1` 抛 `LLVMCodegenError`。  
+循环嵌套：row 循环（rank>1 时）内套 3 个顺序单层循环（max、sum-exp、div），均减最大值以保证稳定；分母在第三趟重算 `exp`，不额外开临时数组。
 
 ```
-pass1 (max):  m = -3.4e38 ; for i: m = max(m, x[i])
-pass2 (sum):  s = 0.0     ; for i: s += expf(x[i] - m)
-pass3 (div):  for i: out[i] = expf(x[i] - m) / s
+for row ∈ [0, prod(shape[:-1])):
+    base = row * shape[-1]
+    pass1 (max):  m = -3.4e38 ; for i: m = max(m, x[base+i])
+    pass2 (sum):  s = 0.0     ; for i: s += expf(x[base+i] - m)
+    pass3 (div):  for i: out[base+i] = expf(x[base+i] - m) / s
 ```
 
-数值校验点：N=1 时 `exp(0)/exp(0) = 1.0`；N=2 且输入 `[0,0]` 时输出 `[0.5,0.5]`。现有占位实现（只发 `expf(x)`）在这些点上即为错误。
+数值校验点：N=1 时 `exp(0)/exp(0) = 1.0`；N=2 且输入 `[0,0]` 时输出 `[0.5,0.5]`；shape `(2,2)` 且输入全 0 时输出 4 个 `0.5`（2D 回归用例）。
 
 #### 2.5.7 gelu（标量激活）
 
@@ -278,10 +288,11 @@ pass3 (div):  for i: out[i] = expf(x[i] - m) / s
 库路径 IR 没有 standalone 的 `MemoryPlan`/workspace，因此约定：
 
 - **指针操作数**：`Value.shape != ()` 或由 `ALLOCA` 定义 ⇒ 该值引用本身就是 `float*`/`double*`/`i32*`。
-- **标量退化**：张量算子的某操作数是标量（shape 为空）时，在当前位置 spill 到 `alloca <ty>, i32 1`（hint `spin`），按 1 元素张量使用；文档与注释中显式标注“degenerate 1-element tensor”，避免误解为完整张量语义。
+- **标量退化**：张量算子的某操作数是标量（shape 为空）时，在当前位置 spill 到 `alloca <ty>, i32 1`（hint `spin`），按 1 元素张量使用。**仅当算子所需元素数为 1 时成立**；若所需元素数 > 1（如 `dot(a,b,len:4)` 的 a/b 为标量）则抛 `LLVMCodegenError`，不再按 attrs 维度循环导致越界读（`_require_elements`）。
 - **结果缓冲**：
   - `instr.dest` 由 `ALLOCA` 定义 → 直接写该 alloca 指针；
-  - `dest.shape` 非空 → `_alloc_slot(element_ty, prod(shape))` 得到缓冲并绑定 `dest` 名为该指针；
+  - `dest.shape` 非空且为元素级算子（add/sub/mul/div/neg/exp/relu/gelu/sigmoid）→ 逐元素循环写入 `_alloc_slot(element_ty, prod(shape))` 缓冲（`_emit_map`）；操作数为标量或单元素张量时广播，其他元素数不匹配则抛错；
+  - `dest.shape` 非空且为点积/矩阵类算子 → `_alloc_slot(element_ty, prod(shape))` 得到缓冲并绑定 `dest` 名为该指针；
   - `dest.shape` 为空 → 分配 1 元素缓冲运行循环，最后 `load` 首元素产生标量 `%dst`（1 元素时与完整语义等价）。
 - **已知边界**：ONNXParser 的输出 `Value` 可能不含 shape，此时按 1 元素缓冲处理——`llvm-as` 合法性不受影响，但**运行时数值仅在显式 shape 的 IR 上有保证**；完整 ONNX 张量语义属于 standalone 路径职责，不在本课题范围。
 - **函数签名**：参数/返回值按 2.2 的指针判定生成 `float*` 等；`ret` 张量时 `ret float* %buf`。
@@ -402,6 +413,7 @@ def assemble(ll_text: str, tmp_path) -> subprocess.CompletedProcess:
 - **输入 IR**（`DSLParser`）：
   ```python
   program = DSLParser().parse(
+      "s = add(s, 0.0)\n"
       "for i = 0, 3\n"
       "for j = 0, 3\n"
       "s = add(s, i)\n"
@@ -409,10 +421,10 @@ def assemble(ll_text: str, tmp_path) -> subprocess.CompletedProcess:
       "endfor\n"
       "return s")
   ```
-  （外层 3 次、内层 3 次、内层每轮累加 `i`，期望 `s = 3×(0+1+2) = 9`。）
 - **预期输出**：`llvm-as` 退出码 0；修复后的标签形如 `loop_i_hdr_*` / `loop_i_bdy_*` / `loop_i_ext_*`，每类各出现 2 次（内外层各一），无重复定义。
 - **关键指令片段**：首块（entry）以 `br label %loop_i_hdr_*` 结束（**preheader 直接跳 header 而非 body**）、`icmp slt i32`、`br i1`、`add i32`、回边 `br label %loop_i_hdr_*`；两个 IV 各有 `load i32, i32*` 定义，循环体混型加法含 `sitofp i32 ... to float`。
-- **数值语义验证**：harness 断言返回值 `9.0`；`lli` 返回 0。
+- **数值语义验证（静态 SSA 语义，见 §5.7）**：DSL 每次赋值产生新 `Value`，`s` 在循环体每轮读到的都是循环前的值，故实际返回 `2.0`（最后一次内层迭代的 `0 + i`），**不是** 9.0。回归用例 `test_lli_dsl_nested_for_static_ssa_value` 显式断言 2.0 并标注该限制。
+- **正确累加形式**（IR 层 memory-based SSA）：用 `IRBuilder` 显式 `alloca`/`load`/`store` 累加得到 9.0，见用例 3b 与 `test_lli_nested_for_accumulator`。
 
 ### 测试用例 3：张量算子结构 + 小规模数值（dot/matmul/gemm/maxpool/conv）
 
@@ -595,3 +607,16 @@ llc -march=riscv64 output.ll -o output.s
 - standalone 参考实现：`scratchv/standalone/onnx_to_llvm_standalone.py`（`LLVMIRBuilder`、`LLVMCNNGenerator`）
 - LLVM IR 类型/常量规则：LLVM Language Reference（LangRef）
 - 设计文档模板：`设计文档模板.md`
+
+### 5.7 已知限制：DSL 变量为静态 SSA 语义（非本课题范围）
+
+DSL 前端（`dsl_parser.py`、`dsl_extended.py`）的 `_vars[name]` 只保存**最近一次赋值**的 `Value`，每次赋值产生一个新的 IR `Value`；IR 无 phi（`types.py` 的 `phi_nodes` 未被任何 pass 使用），因此跨迭代/跨分支的变量语义无法成立。当前行为与回归锁定如下：
+
+| 模式 | 示例 | 实际行为 | 回归测试 |
+|------|------|----------|----------|
+| for 循环累加 | `s = add(s, i)` | 循环体每轮读循环前的 `s`，嵌套双重循环返回 `2.0`（非 9.0） | `test_lli_dsl_nested_for_static_ssa_value` |
+| 循环携带变量 | `for ...: x = add(x, 1.0)` | 返回 `4.0`（非 5.0） | `test_lli_dsl_loop_carried_static_ssa_value` |
+| `while` 条件变量重赋值 | `while (i < 10): i = add(i, 1.0)` | header 永远读旧槽 → 不可能退出；后端 `_check_unbounded_loops` 抛 `LLVMCodegenError` | `test_while_reassigned_condition_raises` |
+| `if/else` 合流 | 两个分支分别给 `y` 赋值 | 合流后恒读最后解析分支（else）的槽；走 then 时该槽未初始化（未定义值） | `test_dsl_if_else_merge_reads_last_parsed_branch` |
+
+**正确的累加/循环携带写法是 IR 层的显式 `alloca`/`load`/`store`**（用例 3b、`test_lli_nested_for_accumulator` 得到 9.0）。把 DSL 可变变量降级为 alloca/load/store 属于"DSL 变量语义"独立课题，不在本分支范围内（评审 §4.1）；本分支只做上述 fail-loud 守卫与文档/回归锁定，禁止静默错误。
