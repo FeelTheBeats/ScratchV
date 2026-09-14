@@ -4,6 +4,7 @@
 > 编写日期：2026-09-14  
 > 涉及模块：`scratchv/frontend/dsl_errors.py`、`scratchv/frontend/dsl_parser.py`、`scratchv/frontend/dsl_extended.py`、`scratchv/frontend/__init__.py`、`scratchv/compiler.py`、`tests/`  
 > 功能范围：接通 `DSLSyntaxError` → `format_error` → `ErrorCollector` → 两个解析器 → 编译驱动的完整错误报告链路  
+> 取代关系：本文档（v2）取代同目录 `09-DSL错误提示美化器-开发文档.md`（v1）；接口契约、收集策略与实现结果一律以本文档为准，v1 与本文档冲突处以本文档为准。  
 > 行号锚点基于 2026-09-14 仓库快照；实施时以"行号 ± 函数/代码内容"双锚点定位，若行号漂移以内容为准。
 
 ---
@@ -75,7 +76,7 @@ class DSLSyntaxError(DSLParseError):
 | `filename` | `Optional[str]` | `None` 时渲染为 `<dsl>` |
 | `fix_hint` | `Optional[str]` | 建议文本（渲染为 `note:`），可为 `None` |
 | `suggestion` | 属性 | `fix_hint` 的读写别名；构造时 `suggestion=` 等价 `fix_hint=`（两者同时给出时以 `fix_hint` 为准） |
-| `error_code` | `Optional[str]` | `E1xx`/`E2xx`/`E3xx`，渲染为 `[E301]` |
+| `error_code` | `Optional[str]` | `E1xx`/`E2xx`/`E3xx`，渲染为 `error[E301]:` 前缀 |
 
 兼容性硬约束：
 
@@ -99,9 +100,10 @@ class ErrorCode:
     # 语义（semantic）
     SEM_UNKNOWN_OP         = "E301"
     SEM_ARITY              = "E302"
+    SEM_UNKNOWN_KWARG      = "E304"
 ```
 
-- 保留但不定义常量：`E206`（缺冒号）、`E303`（未定义变量）、`E304`（未知 kwargs）；
+- 保留但不定义常量：`E206`（缺冒号）、`E303`（未定义变量）；
 - 任何新码只能追加，不得改义。
 
 ### 0.4 公共函数契约
@@ -161,8 +163,9 @@ class ErrorCollector:
         self,
         filename: Optional[str] = None,
         use_color: bool = True,
-        max_errors: int = 20,
+        max_errors: int = 20,          # 必须 >= 1，否则 ValueError
         source: Optional[str] = None,      # 新增
+        context_lines: int = 0,            # 新增
     ) -> None: ...
 
     @property
@@ -184,7 +187,9 @@ class ErrorCollector:
 ```
 
 - `report()` 无错误时返回 `""`；有错误时首行 `--- N error(s) found ---`；
-- 发生抑制时，报告末尾追加一行：`note: N further error(s) suppressed`；
+- `errors` 按 `(line, col, error_code)` 排序返回；`add` 按 `(filename, line, col, error_code, message)` 去重，被抑制的错误同样参与去重；
+- 发生抑制时，报告末尾追加一行：`note: error limit ({max_errors}) reached; {suppressed_count} further errors suppressed`；
+- `max_errors < 1` 抛 `ValueError`（0 会导致"全部抑制但 `has_errors` 为假"的静默误判）；
 - 不再向 `_errors` 注入 line=0 的"伪错误"哨兵（旧实现会污染 `error_count`）。
 
 ### 0.6 解析器契约
@@ -250,7 +255,7 @@ class ExtendedDSLParser(DSLParser):
 两个解析器共用以下实例状态（`__init__` / `parse` 中初始化）：
 
 ```python
-self._raw_lines: list[str] = []              # text.split("\n")，行号-1 即索引
+self._raw_lines: list[str] = []              # text 归一化（\r\n/\r → \n）后 split("\n")，行号-1 即索引
 self._filename: Optional[str] = None         # 透传给 DSLSyntaxError.filename
 self._collector: Optional[ErrorCollector] = None
 self._for_positions: list[tuple[int, int]] = []   # 新增：(line, col) 栈，与 _loop_stack 同步 push/pop
@@ -304,7 +309,7 @@ self._line_no: int = 0                       # 当前行（严格模式抛错时
 | 6 | L62-67 `for` 分支 | 只 push `_loop_stack` | 同步 push `_for_positions.append((line_no, col))` |
 | 7 | L69-74 `endfor` 分支 | 无配对 → `raise DSLParseError(...)` | 无配对 → E204；正常 → 同步 pop `_for_positions` |
 | 8 | L96-108 `_resolve` | 未定义变量自动建值 | **保持不变**（E303 保留）；在 docstring 注明 |
-| 9 | L110-131 `_parse_kwargs` / `_parse_value` | 可用 | 不变 |
+| 9 | L110-131 `_parse_kwargs` / `_parse_value` | 可用 | 修复轮：`_parse_kwargs(args, op, line_no, col)` 按 `OP_SIGNATURES` 校验未知 kwarg 与数值 kwarg（E304），校验失败返回 `None` |
 | 10 | L133-168 `_dispatch_op` | 未知算子 `raise DSLParseError("Unsupported op: ...")`；参数不足泄漏裸 `IndexError`；参数过多静默忽略 | 改为：`op` 不在 `handlers` → E301（**先于实参解析**，避免副作用建值）；按 `_ARITY` 表校验普通实参个数 → E302；多余参数 → E302；返回 `Optional[Value]`（失败返回 `None`） |
 
 ### 1.3 `scratchv/frontend/dsl_extended.py`（379 行）
@@ -457,9 +462,9 @@ elif term == "endwhile":
 ### 3.2 规则
 
 1. **同一行最多一条错误**：错误分支命中即跳过该行，杜绝连锁。
-2. **去重**：`(line, col, error_code, message)` 四元组相同不重复加入。
-3. **上限**：默认 `max_errors=20`；达到上限后新错误只递增 `suppressed_count`，不再存储；报告末尾输出 `note: N further error(s) suppressed`。
-4. **顺序**：插入顺序 = 发现顺序（递归嵌套 E203 自内向外），不做排序。
+2. **去重**：`(filename, line, col, error_code, message)` 五元组相同不重复加入（被抑制的错误同样参与去重）。
+3. **上限**：默认 `max_errors=20`，必须 ≥1（否则 `ValueError`）；达到上限后新的（未去重的）错误只递增 `suppressed_count`，不再存储；报告末尾输出 `note: error limit ({max_errors}) reached; {N} further errors suppressed`。validator 达上限后不再提前 `break`，因此 `suppressed_count` 统计全部未报告错误。
+4. **顺序**：`errors` 属性按 `(line, col, error_code)` 排序返回，不保持插入顺序。
 5. **部分 Program 契约**：`collector.has_errors` 为真时，`parse()` 返回的 `Program` 仅用于诊断/继续收集，**禁止**用于代码生成；调用方（`compiler.py`）不进入收集模式。
 6. **状态一致**：`for`/`while` 栈在错误路径也须 pop；`_vars[dest]` 在失败时不得登记。
 
@@ -468,7 +473,7 @@ elif term == "endwhile":
 ```
 --- {error_count} error(s) found ---
 {format_error(err, use_color=..., source=self.source) for err in errors}
-[note: {suppressed_count} further error(s) suppressed]
+[note: error limit ({max_errors}) reached; {suppressed_count} further errors suppressed]
 ```
 
 ---
@@ -502,7 +507,7 @@ elif term == "endwhile":
 | `test_no_filename_uses_placeholder` | 无 filename → 输出以 `<dsl>:1:1: ` 开头 |
 | `test_suggestion_arity_hint` | `_compute_suggestion("add() expects 2 arguments, got 1", "a = add(1)", "E302")` → 含 `requires exactly 2 arguments` |
 | `test_collector_dedup` | 两次加入相同 `(line,col,code,message)` → `error_count == 1` |
-| `test_collector_suppressed_count` | `max_errors=3`，加 10 条互异 → `error_count == 3`，`suppressed_count == 7`，report 含 `7 further error(s) suppressed` |
+| `test_collector_suppressed_count` | `max_errors=3`，加 10 条互异 → `error_count == 3`，`suppressed_count == 7`，report 含 `7 further errors suppressed` |
 | `test_collector_source_context` | 传 `source` 且 `context_lines=1` → 输出含上一行原文且不含空上下文行 |
 | `test_format_context_without_source_ignored` | 不传 `source`、`context_lines=2` → 不出现空上下文行 |
 
@@ -589,9 +594,8 @@ python -m scratchv --dsl /tmp/bad.dsl -o /tmp/out.s; echo "exit=$?"
 
 ## 实现结果（2026-09-14 集成）
 
-> **集成 commit**：`f045c8c`（`feat(topic09): integrate DSL syntax diagnostics with gcc-style error reporting`）
-> **集成位置**：`Seven_big_summary` 上第 3 个 topic commit（顺序 06 → 07 → **09** → 16 → …）
-> **集成后全量**：`PYTHONPATH=. python3.11 -m pytest tests/ -q` → **1011 passed / 13 xfailed / 20 xpassed / 0 failed**
+> **分支集成 commit**：`795067f`（`feat(topic09): integrate DSL syntax diagnostics with gcc-style error reporting`），文档提交 `6248f15`，基于 main `73c3926`
+> **分支全量**：`PYTHONPATH=. python3.11 -m pytest tests/ -q` → **716 passed / 0 failed**（评审基线）
 
 ### 实现文件与要点
 
@@ -604,20 +608,30 @@ python -m scratchv --dsl /tmp/bad.dsl -o /tmp/out.s; echo "exit=$?"
 | `scratchv/frontend/__init__.py` | 导出顺序调整（保持单向依赖） |
 | `tests/test_dsl_errors.py`（追加）、`tests/test_dsl_errors_integration.py`（新增）、`tests/data/dsl_golden_ir.json` | 单测 + 集成 + 合法 DSL golden 回归 |
 
-### 测试数字
+### 修复轮（2026-09-14，评审后）
+
+评审 `topic09-review.md` 的 P1/P2 修复与本轮代码同步：
+
+- **F1**：`for`/`return` 语句改 `fullmatch` 锚定；`_parse_kwargs` 按 `OP_SIGNATURES` 校验未知 kwarg 与数值 kwarg（E304）。collector 模式不再静默放行 `return x junk`、`for ... junk`、未知/非数值 kwargs。
+- **F2**：`DSLValidator.validate` 达到 `max_errors` 后不再提前 `break`，`suppressed_count` 统计全部未报告错误（50 错 / max=3 → 47）。
+- **F5/F6**：`ErrorCollector(max_errors<1)` 抛 `ValueError`；抑制分支同样写入去重键，重复的被抑制错误不重复计数。
+- **F7**：两个解析器 `_raw_lines` 统一 `\r\n`/`\r` → `\n` 归一化，CRLF 源 strict/collector 的 `source_line` 一致。
+- **F3/F4**：设计文档 §2.2 补双错误码空间映射表；v2 文档按实现校正格式前缀、排序、note 文案、`context_lines`、E304 状态等。
+
+### 测试数字（修复轮后）
 
 | 口径 | 结果 |
 |------|------|
-| 定向（`tests/test_dsl_errors.py` + `tests/test_dsl_errors_integration.py`） | 78 passed |
-| 分支全量（cherry-pick 前） | 608 passed |
-| 集成后全量 | 1011 passed / 13 xfailed / 20 xpassed / 0 failed |
+| 定向（`test_dsl_errors*.py` + `test_dsl_validator.py` + `test_dsl_extended.py` + `test_parser.py` 等） | 231 passed |
+| 分支全量 | **736 passed / 0 failed**（修复前 716，新增 20 条回归用例） |
 
 ### 与本文档的偏差 / 未完成项
 
 - `examples/cnn_model.dsl` 基线本来就不可解析：实现保持报错行为并将其纳入 golden 锁定（**不是**本课题引入的回归）。
-- `$` 错误列号按实现为 15 列（与文档示例列号不同，以实现与测试锁定为准）。
+- `$` 错误列号以实现为 15 列，设计文档示例已同步为 15。
 
 ### 已知限制
 
-- 原先被静默容忍的畸形输入（缺终结符、游离终结符、嵌套调用）改为报错，属行为变更；仅影响非法 DSL，合法 DSL golden 全量回归。
+- 原先被静默容忍的畸形输入（缺终结符、游离终结符、嵌套调用、畸形 `for`/`return`、非法 kwarg）改为报错，属行为变更；仅影响非法 DSL，合法 DSL golden 全量回归。
 - `collector=` 收集模式仅用于测试/诊断，`compiler.py` 不使用收集模式。
+- strict 与 collector 的错误码空间不同（见设计文档 §2.2 映射表）；strict 下 validator 漏检的形态仍可能抛富码（如 E205）。

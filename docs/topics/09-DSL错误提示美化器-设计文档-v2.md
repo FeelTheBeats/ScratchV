@@ -3,7 +3,8 @@
 > 文档版本：v1.0  
 > 编写日期：2026-09-14  
 > 涉及模块：`scratchv/frontend/dsl_errors.py`（错误对象 / 格式化 / 收集器）、`scratchv/frontend/dsl_parser.py`（基础语句解析器）、`scratchv/frontend/dsl_extended.py`（if/while 块解析器）、`scratchv/compiler.py`（编译驱动集成）  
-> 功能范围：DSL 词法/语法/语义错误的精确定位（`file:line:col`）、gcc 风格渲染、修复建议、多错误收集、块结构缺失（缺 `endif`/`endwhile`/`endfor`）诊断。**不含**表达式解析器重写（课题 15）与 ONNX 侧诊断；**保证**合法 DSL 的解析行为与生成 IR 逐字节不变。
+> 功能范围：DSL 词法/语法/语义错误的精确定位（`file:line:col`）、gcc 风格渲染、修复建议、多错误收集、块结构缺失（缺 `endif`/`endwhile`/`endfor`）诊断。**不含**表达式解析器重写（课题 15）与 ONNX 侧诊断；**保证**合法 DSL 的解析行为与生成 IR 逐字节不变。  
+> 取代关系：本文档（v2）取代同目录 `09-DSL错误提示美化器-设计文档.md`（v1）；错误码、消息格式与收集策略一律以本文档为准，v1 与本文档冲突处以本文档为准。
 
 ---
 
@@ -21,7 +22,7 @@
 DSLParseError: Cannot parse line: d = retrun(c)
 
 # 本次交付（gcc 风格）
-bad.dsl:4:5: error: unknown operation 'retrun' [E301]
+bad.dsl:4:5: error[E301]: unknown operation 'retrun'
   4 | d = retrun(c)
     |     ^~~~~~
 note: did you mean 'return'?
@@ -47,7 +48,8 @@ gcc/clang 风格，逐字节格式定义（BNF）：
 ```
 diagnostic     ::= header NL source_display [NL marker] [NL note]
 
-header         ::= location "error: " message [ " [" error_code "]" ]
+header         ::= location error_label ": " message
+error_label    ::= "error" [ "[" error_code "]" ]
 location       ::= (filename | "<dsl>") ":" line ":" col ": "
 source_display ::= gutter_src source_line
 marker         ::= gutter_mark (col-1)*SP "^" ("~")*
@@ -61,7 +63,7 @@ gutter_mark    ::= (3 + len(line_str))*SP "| "
 |------|------|
 | `line` / `col` | 十进制无前导零；`line` 1-based，`col` 1-based |
 | `filename` | 为 `None` 时渲染 `<dsl>`，冒号 prefix 永不为空 |
-| `error_code` | 可选，大写，渲染为 `[E201]` 尾缀 |
+| `error_code` | 可选，大写，渲染为 `error[E201]:` 前缀（无码时仅 `error:`） |
 | `message` | 全小写、无句点、token 用单引号包裹（如 `unknown operation 'retrun'`） |
 | `source_line` | 原文行（不 strip、不含换行符） |
 | 列对齐 | `len(gutter_src) == len(gutter_mark)`；插入符起始显示列 = `len(gutter_src) + (col-1)` |
@@ -74,7 +76,7 @@ gutter_mark    ::= (3 + len(line_str))*SP "| "
 **逐字节样例**（`use_color=False`）：
 
 ```
-unknown_op.dsl:2:5: error: unknown operation 'retrun' [E301]
+unknown_op.dsl:2:5: error[E301]: unknown operation 'retrun'
   2 | b = retrun(a, 1)
     |     ^~~~~~
 note: did you mean 'return'?
@@ -85,7 +87,7 @@ note: did you mean 'return'?
 **双位数行号样例**（L=10，验证行号位数修复）：
 
 ```
-test.dsl:10:5: error: unknown operation 'retrun' [E301]
+test.dsl:10:5: error[E301]: unknown operation 'retrun'
   10 | d = retrun(c)
      |     ^~~~~~
 ```
@@ -106,7 +108,28 @@ test.dsl:10:5: error: unknown operation 'retrun' [E301]
 | E301 | 语义 | `SEM_UNKNOWN_OP` | 未知算子名 | `unknown operation '{op}'` | 算子名 | ✅ |
 | E302 | 语义 | `SEM_ARITY` | 实参个数不符 | `{op}() expects {n} argument(s), got {m}` | 算子名 | ✅ |
 | E303 | 语义 | `SEM_UNDEFINED_VAR` | 使用未赋值变量 | 预留（`_resolve` 首次出现即建值，保持现状） | — | ◻ |
-| E304 | 语义 | `SEM_UNKNOWN_KWARG` | 未知 `key:value` 实参 | 预留（当前静默忽略） | — | ◻ |
+| E304 | 语义 | `SEM_UNKNOWN_KWARG` | 未知 `key:value` 实参，或数值 kwarg 值非数字 | `invalid keyword argument '{k}'` / `'{k}' requires a numeric value` | kwarg 名首字符 | ✅ |
+
+**双错误码空间映射（strict validator ↔ collector 富解析器）**：同一输入在 strict 模式下先由 `DSLValidator` 预校验（`E1xx`/`E2xx`），collector 模式跳过预校验、由富解析器报右侧码。**同一个数字码在两个空间含义不同**，跨模式比较错误码没有意义，下表为显式映射与歧义标注：
+
+| strict（validator） | collector（富解析器） | 说明 / 歧义 |
+|---------------------|----------------------|-------------|
+| `E100` cannot parse statement / for statement | `E201` invalid statement | 含 `return x junk`、`for i = 0, 4 junk` 等畸形语句 |
+| `E100` return requires a value | `E201`（兜底分支） | 富解析器不单列"return 缺值"码 |
+| `E101`（括号不平衡） | `E201`（带括号修复 hint） | **歧义**：`E101` 在 strict 为括号错误，在富空间为非法字符 |
+| `E101`（`if`/`while` 缺括号条件） | `E202` invalid condition | — |
+| `E103` invalid identifier / loop variable | `E201` | 富解析器不区分标识符合法性 |
+| `E110` 游离/错配终结符 | `E204` stray terminator | — |
+| `E111` unterminated block | `E203` missing terminator | — |
+| `E112` else 问题 | `E204` | — |
+| `E200` unsupported operation | `E301` unknown operation | **歧义**：`E200` 仅存在于 strict 空间 |
+| `E201` arity（positional 个数） | `E302` arity | **歧义**：`E201` 在 strict 为 arity，在富空间为 invalid statement |
+| `E202` 未知/缺少 keyword | `E304` invalid keyword argument | — |
+| `E203` 值缺失/非数字 | `E304` requires a numeric value | **歧义**：`E203` 在 strict 为参数值错误，在富空间为 missing terminator |
+| （strict 归入 `E100`） | `E101` illegal character | — |
+| `E201`（实参被逗号拆分后计数不符）或 `E205`（validator 漏检走富路径） | `E205` nested call | 嵌套调用 strict 下码不稳定（如 `c = add(mul(a, b), d)` → `E201`，`a = add(mul(b, c))` → `E205`） |
+
+> 另注：strict 模式在 validator 未命中时会继续走富解析器并抛出富码（上表 E205 一行的后一种情况），因此 strict 观测到的码不全是 `E1xx`/`E2xx`。若后续要求"错误码跨模式稳定"，需将 validator 码重编号或映射进统一命名空间（本课题不做）。
 
 **算子实参个数基准**（E302 判定，仅统计普通实参，`k:v` kwargs 不计）：
 
@@ -169,7 +192,7 @@ test.dsl:10:5: error: unknown operation 'retrun' [E301]
 约束规则：
 
 - 同一未闭合块**只报一条** E203，避免级联噪音。
-- 嵌套多个未闭合块时按"发现顺序"上报（递归自内向外，后进先出）；收集器**不排序**，顺序即插入顺序。
+- 嵌套多个未闭合块时按"发现顺序"上报（递归自内向外，后进先出）；收集器按 `(line, col, error_code)` 排序后输出，不保持插入顺序。
 - 缺终结符时，块内已成功的合法语句保留其 IR；块结束时补齐跳转标签（与正常解析的块结构一致），避免 IR verifier 报未终结块。
 - E203 的插入符覆盖关键字本身（`if` → `^~`，`while` → `^~~~~`，`for` → `^~~`）。
 
@@ -216,18 +239,20 @@ return x
 
 | 输入（关键行） | 预期 header |
 |----------------|-------------|
-| `d = retrun(c)` | `f.dsl:1:5: error: unknown operation 'retrun' [E301]` |
-| `a = add(1)` | `f.dsl:1:5: error: add() expects 2 arguments, got 1 [E302]` |
-| `a = add()` | `f.dsl:1:5: error: add() expects 2 arguments, got 0 [E302]` |
-| `if a > b:` | `f.dsl:1:1: error: invalid condition in 'if'; expected 'if (<expr>) <op> (<expr>):' [E202]` |
-| `if (a > b)` 无 endif 到 EOF | `f.dsl:<if行>:1: error: missing 'endif' for 'if' opened here [E203]` |
-| `while (i < 9)` 无 endwhile 到 EOF | `f.dsl:<while行>:1: error: missing 'endwhile' for 'while' opened here [E203]` |
-| `for i = 0, 4` 无 endfor 到 EOF | `f.dsl:<for行>:1: error: missing 'endfor' for 'for' opened here [E203]` |
-| 顶层裸 `endwhile` | `f.dsl:1:1: error: 'endwhile' without matching 'while' [E204]` |
-| 顶层裸 `endfor` | `f.dsl:1:1: error: 'endfor' without matching 'for' [E204]` |
-| `if` 块外裸 `else:` | `f.dsl:1:1: error: 'else' without matching 'if' [E204]` |
-| `c = add(mul(a, b), d)` | `f.dsl:1:12: error: nested function call is not supported [E205]` |
-| `a = add(b, c) $` | `f.dsl:1:16: error: unexpected character '$' [E101]` |
+| `d = retrun(c)` | `f.dsl:1:5: error[E301]: unknown operation 'retrun'` |
+| `a = add(1)` | `f.dsl:1:5: error[E302]: add() expects 2 arguments, got 1` |
+| `a = add()` | `f.dsl:1:5: error[E302]: add() expects 2 arguments, got 0` |
+| `if a > b:` | `f.dsl:1:1: error[E202]: invalid condition in 'if'; expected 'if (<expr>) <op> (<expr>):'` |
+| `if (a > b)` 无 endif 到 EOF | `f.dsl:<if行>:1: error[E203]: missing 'endif' for 'if' opened here` |
+| `while (i < 9)` 无 endwhile 到 EOF | `f.dsl:<while行>:1: error[E203]: missing 'endwhile' for 'while' opened here` |
+| `for i = 0, 4` 无 endfor 到 EOF | `f.dsl:<for行>:1: error[E203]: missing 'endfor' for 'for' opened here` |
+| 顶层裸 `endwhile` | `f.dsl:1:1: error[E204]: 'endwhile' without matching 'while'` |
+| 顶层裸 `endfor` | `f.dsl:1:1: error[E204]: 'endfor' without matching 'for'` |
+| `if` 块外裸 `else:` | `f.dsl:1:1: error[E204]: 'else' without matching 'if'` |
+| `c = add(mul(a, b), d)` | `f.dsl:1:12: error[E205]: nested function call is not supported` |
+| `a = add(b, c) $` | `f.dsl:1:15: error[E101]: unexpected character '$'` |
+| `a = add(x, y, foo:1)` | `f.dsl:1:15: error[E304]: invalid keyword argument 'foo'` |
+| `m = matmul(a, b, rows:abc)` | `f.dsl:1:18: error[E304]: 'rows' requires a numeric value` |
 
 （注：`c = add(mul(a, b), d)` 中第 12 列是内层 `(`：`c = add(` 占 8 列，`mul` 占 9–11 列。）
 
@@ -253,7 +278,7 @@ return x
 **预期错误消息**（`format_error(e, use_color=False)` 逐字节）：
 
 ```
-unknown_op.dsl:2:5: error: unknown operation 'retrun' [E301]
+unknown_op.dsl:2:5: error[E301]: unknown operation 'retrun'
   2 | b = retrun(a, 1)
     |     ^~~~~~
 note: did you mean 'return'?
@@ -285,7 +310,7 @@ note: did you mean 'return'?
 **预期错误消息**：
 
 ```
-missing_endif.dsl:2:1: error: missing 'endif' for 'if' opened here [E203]
+missing_endif.dsl:2:1: error[E203]: missing 'endif' for 'if' opened here
   2 | if (i > 0):
     | ^~
 note: add 'endif' to close this block
@@ -318,19 +343,19 @@ note: add 'endif' to close this block
 
 ```
 --- 4 error(s) found ---
-multi_error.dsl:1:5: error: add() expects 2 arguments, got 1 [E302]
+multi_error.dsl:1:5: error[E302]: add() expects 2 arguments, got 1
   1 | a = add(1)
     |     ^~~
 note: add() requires exactly 2 arguments
-multi_error.dsl:2:5: error: unknown operation 'retrun' [E301]
+multi_error.dsl:2:5: error[E301]: unknown operation 'retrun'
   2 | b = retrun(a, 2)
     |     ^~~~~~
 note: did you mean 'return'?
-multi_error.dsl:3:1: error: invalid condition in 'if'; expected 'if (<expr>) <op> (<expr>):' [E202]
+multi_error.dsl:3:1: error[E202]: invalid condition in 'if'; expected 'if (<expr>) <op> (<expr>):'
   3 | if a > 0:
     | ^~
 note: expected one of ==, !=, <, >, <=, >= and parentheses around each operand
-multi_error.dsl:5:1: error: 'endwhile' without matching 'while' [E204]
+multi_error.dsl:5:1: error[E204]: 'endwhile' without matching 'while'
   5 | endwhile
     | ^~~~~~~~
 note: remove this line or add a matching 'while'
@@ -425,19 +450,19 @@ note: remove this line or add a matching 'while'
 
 ```
 --- 4 error(s) found ---
-multi_error.dsl:1:5: error: add() expects 2 arguments, got 1 [E302]
+multi_error.dsl:1:5: error[E302]: add() expects 2 arguments, got 1
   1 | a = add(1)
     |     ^~~
 note: add() requires exactly 2 arguments
-multi_error.dsl:2:5: error: unknown operation 'retrun' [E301]
+multi_error.dsl:2:5: error[E301]: unknown operation 'retrun'
   2 | b = retrun(a, 2)
     |     ^~~~~~
 note: did you mean 'return'?
-multi_error.dsl:3:1: error: invalid condition in 'if'; expected 'if (<expr>) <op> (<expr>):' [E202]
+multi_error.dsl:3:1: error[E202]: invalid condition in 'if'; expected 'if (<expr>) <op> (<expr>):'
   3 | if a > 0:
     | ^~
 note: expected one of ==, !=, <, >, <=, >= and parentheses around each operand
-multi_error.dsl:5:1: error: 'endwhile' without matching 'while' [E204]
+multi_error.dsl:5:1: error[E204]: 'endwhile' without matching 'while'
   5 | endwhile
     | ^~~~~~~~
 note: remove this line or add a matching 'while'
@@ -479,6 +504,7 @@ if collector.has_errors:
 | E205 | `nested function call is not supported` | `assign the inner call to a temporary variable first` |
 | E301 | `unknown operation '{op}'` | 拼写库 / `did you mean '{cand}'?` |
 | E302 | `{op}() expects {n} argument(s), got {m}` | `{op}() requires exactly {n} arguments` |
+| E304 | `invalid keyword argument '{k}'` / `'{k}' requires a numeric value` | `'{k}' is not accepted by {op}()` / `pass a number for '{k}', got '{v}'` |
 
 ### 5.3 如何扩展新错误类型
 
