@@ -48,6 +48,47 @@ def _assert_verifier_clean(program) -> None:
     assert errors == []
 
 
+def _undefined_operands(func):
+    """Names of non-constant operands with no definition in *func*.
+
+    ``IRVerifier`` treats undefined operands as implicit inputs (existing
+    repository defect), so tests assert this explicitly for F2/F3/F4.
+    """
+    defined_ids = {id(v) for v in func.params}
+    defined_ids |= {id(v) for v in func.locals}
+    defined_names = {v.name for v in func.params}
+    defined_names |= {v.name for v in func.locals}
+    for block in func.blocks:
+        for ins in block.instructions:
+            if ins.dest is not None:
+                defined_ids.add(id(ins.dest))
+                defined_names.add(ins.dest.name)
+
+    offenders = []
+    for block in func.blocks:
+        for ins in block.instructions:
+            for op in ins.operands:
+                if op.is_constant:
+                    continue
+                if id(op) in defined_ids or op.name in defined_names:
+                    continue
+                offenders.append(f"{func.name}.{block.name}: ${op.name}")
+    return offenders
+
+
+def _assert_operands_defined(program) -> None:
+    offenders = [
+        offender
+        for func in program.functions
+        for offender in _undefined_operands(func)
+    ]
+    assert offenders == []
+
+
+def _assert_function_operands_defined(func) -> None:
+    assert _undefined_operands(func) == []
+
+
 def _block_by_name(func, name):
     return next(block for block in func.blocks if block.name == name)
 
@@ -452,6 +493,56 @@ class TestInlineReject:
         assert inl.stats["rejected"] == 1
         assert any("multiple_valued_returns" in w for w in inl.warnings)
 
+    def test_mixed_return_forms_rejected(self):
+        """One valued + one void RETURN must not be inlined (F3)."""
+        b = IRBuilder()
+        a = b.make_value(name="a")
+        b.new_function("f", params=[a])
+        b.new_block("entry")
+        c = b.load_const(1.0)
+        t = b.add(a, a)
+        b.br_if(c, "r1", "r2")
+        b.new_block("r1")
+        b.ret(t)
+        b.new_block("r2")
+        b.ret()
+        b.new_function("main")
+        b.new_block("entry")
+        x = b.make_const(3.0)
+        r = b.call("f", [x])
+        b.ret(r)
+        before = b.program.dump()
+
+        inl = Inliner(b.program, InlinerConfig())
+        assert inl.run() == 0
+        assert inl.stats["inlined"] == 0
+        assert inl.stats["rejected"] == 1
+        assert b.program.dump() == before
+        assert any("ret_arity_mismatch" in w for w in inl.warnings)
+        _assert_operands_defined(b.program)
+
+    def test_callee_without_return_rejected(self):
+        """A callee with no RETURN would clone unterminated blocks (F3)."""
+        b = IRBuilder()
+        a = b.make_value(name="a")
+        b.new_function("trap", params=[a])
+        b.new_block("entry")
+        b.add(a, a)
+        b.new_function("main")
+        b.new_block("entry")
+        x = b.make_const(1.0)
+        b.call("trap", [x], has_ret=False)
+        b.ret(x)
+        before = b.program.dump()
+
+        inl = Inliner(b.program, InlinerConfig())
+        assert inl.run() == 0
+        assert inl.stats["inlined"] == 0
+        assert inl.stats["rejected"] == 1
+        assert b.program.dump() == before
+        assert any("missing_return" in w for w in inl.warnings)
+        _assert_operands_defined(b.program)
+
 
 class TestInlineBlocks:
     def test_void_multi_return_redirects(self):
@@ -575,6 +666,44 @@ class TestInlineBlocks:
         assert inl.stats["rejected"] == 0
         _assert_no_call(b.program)
         _assert_verifier_clean(b.program)
+        _assert_operands_defined(b.program)
+
+    def test_call_target_ignores_block_name_collision(self):
+        """A callee block named like the called function must not rewrite
+        the nested CALL target (F2)."""
+        b = IRBuilder()
+        a = b.make_value(name="a")
+        b.new_function("g", params=[a])
+        b.new_block("entry")
+        r = b.call("g", [a])  # recursive: stays a CALL
+        b.ret(r)
+
+        fa = b.make_value(name="a")
+        b.new_function("f", params=[fa])
+        b.new_block("g")  # block name collides with function name g
+        rg = b.call("g", [fa])
+        b.ret(rg)
+
+        main = b.new_function("main")
+        b.new_block("entry")
+        x = b.make_const(1.0)
+        rm = b.call("f", [x])
+        b.ret(rm)
+
+        inl = Inliner(b.program, InlinerConfig())
+        assert inl.run() == 1
+        assert inl.stats["inlined"] == 1
+        assert not any("callee_not_found" in w for w in inl.warnings)
+
+        # The clone of f's block "g" keeps the CALL to function "g".
+        clone_calls = [
+            ins.target
+            for blk in main.blocks
+            for ins in blk.instructions
+            if ins.opcode is OpCode.CALL
+        ]
+        assert clone_calls == ["g"]
+        _assert_operands_defined(b.program)
 
     def test_call_at_end_of_block_warns(self):
         b = IRBuilder()
@@ -668,3 +797,125 @@ class TestPipelineIntegration:
         assert config.inline_max_instrs == 7
         assert config.inline_single_site is True
         assert config.minimal_call_codegen is True
+
+    def test_dce_keeps_call_with_unused_result(self):
+        """CALL has unknown side effects and must survive DCE (F1)."""
+        from scratchv.compiler import CompilerConfig, CompilerDriver
+
+        b = IRBuilder()
+        p = b.make_value(name="p")
+        v = b.make_value(name="v")
+        b.new_function("side_effect", params=[p, v])
+        b.new_block("entry")
+        b.store(p, v)
+        b.ret()
+        b.new_function("main")
+        b.new_block("entry")
+        x = b.make_const(1.0)
+        y = b.make_const(2.0)
+        b.call("side_effect", [x, y])  # result unused
+        b.ret(x)
+
+        driver = CompilerDriver(CompilerConfig(optimize_level="basic"))
+        driver._run_optimizations(b.program)
+
+        calls = [
+            ins
+            for func in b.program.functions
+            for block in func.blocks
+            for ins in block.instructions
+            if ins.opcode is OpCode.CALL
+        ]
+        assert len(calls) == 1
+        stores = [
+            ins
+            for func in b.program.functions
+            for block in func.blocks
+            for ins in block.instructions
+            if ins.opcode is OpCode.STORE
+        ]
+        assert len(stores) == 1
+
+    def test_licm_does_not_hoist_call_out_of_loop(self):
+        """Calling once per iteration cannot become a loop invariant (F1)."""
+        from scratchv.compiler import CompilerConfig, CompilerDriver
+
+        b = IRBuilder()
+        a = b.make_value(name="a")
+        b.new_function("f", params=[a])
+        b.new_block("entry")
+        iv = b.for_loop(0, 4)
+        r = b.call("f", [a])  # recursive: CALL survives inlining
+        s = b.add(iv, r)
+        b.endfor()
+        b.ret(s)
+
+        driver = CompilerDriver(CompilerConfig(optimize_level="all"))
+        driver._run_optimizations(b.program)
+
+        instrs = b.program.functions[0].blocks[0].instructions
+        ops = [ins.opcode for ins in instrs]
+        for_index = ops.index(OpCode.FOR)
+        call_index = ops.index(OpCode.CALL)
+        endfor_index = ops.index(OpCode.ENDFOR)
+        assert for_index < call_index < endfor_index
+
+    def test_multi_block_callee_damaged_by_block_local_dce_is_rejected(self):
+        """F4: DCE removes cross-block definitions before the inliner runs.
+
+        The damaged callee must be rejected (no silent dangling clone) and
+        the caller must keep a well-formed CALL.
+        """
+        from scratchv.compiler import CompilerConfig, CompilerDriver
+
+        b = IRBuilder()
+        v = b.make_value(name="v")
+        b.new_function("g", params=[v])
+        b.new_block("entry")
+        c = b.load_const(1.0)
+        b.br_if(c, "left", "join")
+        b.new_block("left")
+        t = b.add(v, v)
+        b.br("join")
+        b.new_block("join")
+        b.ret(t)
+
+        main = b.new_function("main")
+        b.new_block("entry")
+        x = b.make_const(3.0)
+        r = b.call("g", [x])
+        b.ret(r)
+
+        driver = CompilerDriver(CompilerConfig(
+            optimize_level="basic", inline=True))
+        result = driver._run_optimizations(b.program)
+
+        assert any("undefined_operand" in w for w in result.warnings)
+        assert not any(
+            blk.name.startswith("g_") for blk in main.blocks)
+        assert len(main.blocks) == 1
+        _assert_function_operands_defined(main)
+
+    def test_cli_prints_inliner_notes_on_codegen_failure(
+            self, tmp_path, capsys, monkeypatch):
+        """F7: rejection reasons are visible when codegen fails."""
+        from scratchv import main as main_module
+        from scratchv.compiler import CompileResult
+
+        def fake_compile(self, *args, **kwargs):
+            return CompileResult(
+                success=False,
+                errors=["Codegen error: CALL f: ABI not implemented"],
+                warnings=["inliner: skip f at main.entry[0]: recursive_callee"],
+            )
+
+        monkeypatch.setattr(
+            main_module.CompilerDriver, "compile", fake_compile)
+        code = main_module.main([
+            str(tmp_path / "in.dsl"), "-o", str(tmp_path / "out.s")])
+
+        assert code == 1
+        stderr = capsys.readouterr().err
+        assert "Error: Codegen error" in stderr
+        assert "note: inliner: skip f" in stderr
+        assert "recursive_callee" in stderr
