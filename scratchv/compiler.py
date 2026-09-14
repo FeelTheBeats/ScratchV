@@ -249,6 +249,26 @@ class CompilerDriver:
         if output_path is None:
             output_path = "output.ll" if self.config.backend == "llvm" else "output.s"
 
+        # Vectorization preconditions (Topic 29 phase 1, review F5/F6):
+        # the LLVM backend silently drops vector ops into comments, and an
+        # out-of-range width used to crash with ZeroDivisionError deep in
+        # the pass.  Both are rejected with a clear error before parsing.
+        if self.config.vectorize:
+            from scratchv.optimizer.vectorize import validate_vector_width
+            try:
+                validate_vector_width(self.config.vector_width)
+            except ValueError as exc:
+                return CompileResult(success=False, errors=[str(exc)])
+            if self.config.backend == "llvm":
+                return CompileResult(
+                    success=False,
+                    errors=[
+                        "vectorize is not supported with --backend llvm "
+                        "(Topic 29 phase 1 targets the RISC-V backend); "
+                        "disable --vectorize or use --backend riscv"
+                    ],
+                )
+
         use_dsl = (
             dsl_source is not None
             or (input_path and input_path.endswith(".dsl"))
@@ -313,6 +333,12 @@ class CompilerDriver:
                     "vectorize is incompatible with --dag-isel; "
                     "falling back to linear isel")
                 self.config.use_dag_isel = False
+            if self.config.reg_alloc == "linear":
+                warnings.append(
+                    "vectorize requires the greedy register allocator; "
+                    "linear-scan label emission is broken, falling back "
+                    "to greedy")
+                self.config.reg_alloc = "greedy"
             vec_result = self._run_vectorizer(program)
             warnings.extend(vec_result.warnings)
             if vec_result.message:
