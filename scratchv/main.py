@@ -105,7 +105,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Use extended instruction selector with fp64/sqrt/min/max/abs support (Topic 28)",
     )
     parser.add_argument(
-        "--no-loop-unroll", action="store_true",
+        "--loop-unroll", dest="loop_unroll", action="store_true",
+        default=False,
+        help="Enable IR loop unrolling at --optimize all (Topic 10). "
+             "Opt-in: disabled by default while the greedy register "
+             "allocator spills without reloading.",
+    )
+    parser.add_argument(
+        "--no-loop-unroll", dest="loop_unroll", action="store_false",
         help="Disable IR loop unrolling at --optimize all (Topic 10)",
     )
     parser.add_argument(
@@ -179,7 +186,7 @@ def args_to_config(args: argparse.Namespace) -> CompilerConfig:
         cycle_stats=args.cycle_stats,
         enable_forwarding=not args.no_forwarding,
         branch_predictor=args.branch_predictor,
-        loop_unroll=not args.no_loop_unroll,
+        loop_unroll=args.loop_unroll,
         unroll_max_factor=args.unroll_factor,
         unroll_full_threshold=args.unroll_full_threshold,
         unroll_body_limit=args.unroll_body_limit,

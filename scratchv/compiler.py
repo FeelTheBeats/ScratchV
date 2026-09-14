@@ -53,7 +53,9 @@ class CompilerConfig:
         cycle_stats:    Run 5-stage pipeline cycle estimation (detailed).
         enable_forwarding:  Enable forwarding in cycle estimator.
         branch_predictor:   Branch predictor mode for cycle estimator.
-        loop_unroll:        Run IR loop unrolling at optimize_level "all".
+        loop_unroll:        Run IR loop unrolling at optimize_level "all"
+                            (opt-in until the greedy allocator reload defect
+                            is fixed).
         unroll_max_factor:      Max unroll factor for partial unrolling.
         unroll_full_threshold:  Fully unroll loops with trip count <= N.
         unroll_body_limit:      Max loop-body IR instructions eligible.
@@ -79,7 +81,7 @@ class CompilerConfig:
     cycle_stats: bool = False
     enable_forwarding: bool = True
     branch_predictor: str = "always_not_taken"
-    loop_unroll: bool = True
+    loop_unroll: bool = False
     unroll_max_factor: int = 8
     unroll_full_threshold: int = 8
     unroll_body_limit: int = 64
