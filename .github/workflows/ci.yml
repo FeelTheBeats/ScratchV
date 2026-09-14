@@ -107,6 +107,15 @@ jobs:
         run: |
           python3.12 -m pytest tests/test_pr37_regression.py -v --tb=short
 
+      - name: Run topic28 extended-isel regressions
+        run: |
+          python3.12 -m pytest \
+            tests/test_extended_isel_cli.py \
+            tests/test_inst_select_ext.py \
+            tests/test_riscv_encoder_fd.py \
+            tests/test_topic28_extended_isel_case_report.py \
+            -v --tb=short
+
       - name: Generate test visualization page
         if: github.ref == 'refs/heads/main'
         run: |
@@ -217,6 +226,14 @@ jobs:
             benchmarks/cases/const_merge_feature.asm \
             --json benchmark_reports/const_merge_report.json \
             --markdown benchmark_reports/const_merge_report.md
+
+      # ── 3.1.3 课题28：扩展指令选择 case 报告（A/B + 编码器门禁） ───────
+      - name: Topic 28 extended instruction-selection case report
+        run: |
+          mkdir -p benchmark_reports
+          python3.12 benchmarks/run_topic28_extended_isel_case.py \
+            --json benchmark_reports/extended_isel_report.json \
+            --markdown benchmark_reports/extended_isel_report.md
 
       # ── 3.2 DSL 用例编译 + 模拟基准 ────────────────────────────────────
       - name: DSL case compilation benchmarks
@@ -362,6 +379,9 @@ jobs:
           fi
           if [ -f benchmark_reports/const_merge_report.md ]; then
             cat benchmark_reports/const_merge_report.md >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f benchmark_reports/extended_isel_report.md ]; then
+            cat benchmark_reports/extended_isel_report.md >> $GITHUB_STEP_SUMMARY
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ -f benchmark_reports/github_summary.md ]; then
