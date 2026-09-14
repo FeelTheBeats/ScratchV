@@ -34,7 +34,7 @@
 | C5 | 新增 | `load_scratchv_image()`：`load_binary(code_words, 0)` + `load_data(weights, data_offset)` + `load_data(input_blob, 160MiB)` | 权重与输入真实装载 |
 | C6 | `:160-184` `_prepare_asm_for_tinyfive` | 删除；新增 `parse_labels()`，标签不再被过滤，`.s` 只用于标签映射与静态计数，不用于装载代码 | 修复分支自跳转 |
 | C7 | `:187-234` `_tinyfive_static_fallback` | 删除；静态计数改由 `static_instruction_mix()` 产出，字段独立为 `static_instruction_mix` | 静态数不冒充动态数 |
-| C8 | `:118-157` `run_tinyfive` | 替换为分块执行器：`chunk` 循环 + `m.pc == halt_addr` 停机检测 + `SIGALRM` 超时 + 完整 provenance 输出 | 停机/预算/超时可控 |
+| C8 | `:118-157` `run_tinyfive` | 替换为分块执行器：`chunk` 循环 + 实例级 `exe` 停机 shim（`halt_addr`/预算先到者停）+ `SIGALRM` 超时 + 完整 provenance 输出 | 停机/预算/超时可控 |
 | C9 | `:58-104` `compile_llvm_rv32` | llvmlite 可用时 `llmod.triple="riscv32-unknown-elf"`；新增 `detect_isa_mismatch()`；静态计数只扫 `.text`；失败原因入档 | 统一 RV32 口径与诚实降级 |
 | C10 | `:241-312` `BenchResult` / `generate_report` | 改为 `build_report()`（schema v2 dict）+ `bench_report.render_*(report)`；删除硬编码模型描述、无依据 ratio 与 “No analytical estimates” 文案 | 诚实报告 |
 | C11 | `:383-425` `main` | 新增 CLI 参数、退出码、`audit_provenance` 写盘前检查、`--quiet` | 接口规格化 |
@@ -55,17 +55,18 @@ sv.tinyfive = run_tinyfive(str(out / "_sv.s"), n_instructions=5000)     # :411
 ```python
 def run_simulation(
     *,
-    asm_path: str,
+    asm_path: str,                    # 登记用；代码装载走 binary_path
     binary_path: str,
+    data_offset: int,
+    workspace_bytes: int,
+    input_elements: int,
+    output_elements: int,
     max_instructions: int = 0,        # 0 = 全量
     mem_size: int = 268435456,
     timeout_s: float = 900.0,
     chunk_instructions: int = 10_000_000,
     input_seed: int = 42,
-    input_elements: int,
-    output_elements: int,
-    halt_addr: int,
-) -> dict: ...
+) -> dict: ...                        # -> {"dynamic": …, "output": …}; halt_addr 由 compute_layout 内部计算
 ```
 
 调用点：
@@ -108,7 +109,7 @@ CLI 语义：`--max-instructions 0`（默认）与 `--full` 等价；两者与 `
 `.s` 格式：标签独占一行（列 0，`name:`），指令行缩进两格并可能带 `# 注释`（`RISCVEmitter.disassemble()`，`onnx_to_riscv_standalone.py:1291-1305`）。
 
 ```python
-def parse_labels(asm_text: str) -> dict[int, str]:
+def parse_labels(asm_text: str, expected_code_bytes: int) -> dict[int, str]:
     pc, labels, seen_tokens = 0, {}, []
     for raw in asm_text.splitlines():
         line = raw.split("#", 1)[0].rstrip()
@@ -143,14 +144,14 @@ def parse_labels(asm_text: str) -> dict[int, str]:
 | 助记符预检失败 | 子集扫描 `.s` vs TinyFive 支持表 | `completion="not_run"`，exit 4，列出不支持助记符 |
 | 预算耗尽 | 循环额度判断 | `completion="budget_exhausted"`，`executed==limit`，ratio `null`，exit 0（显式预算属正常） |
 | 超时 | `SIGALRM` + `_timed_out` 标志 | `completion="timeout"`，保留部分 ops，exit 0（`--fail-on-incomplete` 时 exit 7） |
-| `m.last_error` 非空且非超时 | 适配器 `strict=True` 抛错 | `completion="error"`，`dynamic=null`，exit 1 |
+| `m.last_error` 非空且非超时 | 适配器 `strict=True` 抛错 | `source="unavailable"` + `completion="error"`，`ops=null`，`output.partial=true`，exit 1 |
 | 未完成且要求严格 | `--fail-on-incomplete` | exit 7 |
 
 静态兜底已删除：`static_instruction_mix` 只写入 `scratchv.static_instruction_mix`，字段名带 `static_`，永不出现在 `dynamic.ops`。
 
 ### 2.6 LLVM 侧改动（C9）
 
-1. `binding.Target.from_triple("riscv32-unknown-elf")`；`ImportError`/`RuntimeError` → `status="skipped"`，`reason` 记录原始异常。llvmlite 当前环境未安装，该分支即 `skipped`。
+1. `binding.Target.from_triple("riscv32-unknown-elf")`；`ImportError`（llvmlite 未安装）→ `status="skipped"`，`reason` 记录原始异常；成功导入后的目标机/IR/发射阶段异常（如 `RuntimeError`）→ `status="failed"`，`reason` 记录真实原因，`main` 追加 warning 并把它写入 `llvm.dynamic.reason`（不再统一硬编码为 “pipeline not implemented”）。llvmlite 当前环境未安装，该分支即 `skipped`。
 2. 成功路径。解析 IR 文本后，用 llvmlite API 覆盖模块头：
    ```python
    llmod = binding.parse_assembly(ir_text)
@@ -215,6 +216,8 @@ def parse_labels(asm_text: str) -> dict[int, str]:
 Simulated by tinyfive {environment.tinyfive} | completion={completion} | executed={executed}
 | limit={limit} | memory={memory_size_bytes} | seed={input_seed} | halt=0x{halt_addr:x}
 | model sha256={model.sha256} | binary sha256={scratchv.compile.binary_sha256}
+output [measured | measured/partial | unavailable]: {output.raw_hex}
+| elements={output.elements} | completion={output.completion}
 ```
 
 渲染规则：
@@ -238,7 +241,7 @@ Simulated by tinyfive {environment.tinyfive} | completion={completion} | execute
 | `scratchv.compile.status/binary/binary_bytes/binary_sha256/code_bytes/data_offset/data_offset_source/data_bytes/workspace_bytes/static_insns/static_source/elapsed_s` | — | static | 编译与镜像 |
 | `scratchv.static_instruction_mix.{source,load,store,mul,add,madd,branch,other}` | int | static | 静态助记符分布 |
 | `scratchv.dynamic.{source,simulator,simulator_version,completion,limit,executed,timeout_s,elapsed_s,memory_size_bytes,input_seed,input_elements,halt_addr,ops{total,load,store,mul,add,madd,branch},x_registers_used,x_usage_total,f_registers_used,per_label,per_label_note,last_error}` | — | measured | 动态执行 |
-| `scratchv.output.{addr,elements,raw_hex,q16_16}` | — | measured | 输出读出 |
+| `scratchv.output.{addr,elements,raw_hex,q16_16,completion,partial}` | — | measured | 输出读出；`q16_16` 恒为 list（不可用时为 null）；`completion != "halted"` 时 `partial=true`，Markdown/HTML 的 Provenance 段落标 `[measured/partial]` |
 | `llvm.compile.{status,reason,isa_detected,isa_mismatch,static_insns,static_source,elapsed_s}` | — | static/unavailable | LLVM 侧 |
 | `llvm.dynamic.{source,simulator,completion,reason,ops}` | — | unavailable | 失败必须 `ops=null` |
 | `comparison.{dynamic_instruction_ratio,incomparable_reason}` | float\|null | measured 派生 | 比值规则见设计文档 2.1.1 |
@@ -265,7 +268,7 @@ Simulated by tinyfive {environment.tinyfive} | completion={completion} | execute
 
 ### 4.2 `benchmark.py`（只读使用）
 
-- `estimate_cnn_model(model_spec=None) -> dict`：仅用于 `warnings` 与“预计墙钟”提示；字段进入 `estimated` 分类，前缀 `estimated_`。不得写入 `dynamic`。
+- `estimate_cnn_model(model_spec=None) -> dict`：**未接入 `rv32_bench.py`**（本课题不做自动预估）；仅 `benchmark.py` 自身 CLI 使用。若未来引入，其字段必须进入 `estimated` 分类，前缀 `estimated_`，不得写入 `dynamic`。
 - `RV32EmulatorFast` / `run_benchmark`：仅测试用例 1 作为独立功能对照（`load_unified_binary(binary, code_size_base=..., load_addr=0)` + `run(max_instr=...)`）；其计数分类（`Cat_*`）与 TinyFive 不同，只对照 `total/load_count/store_count/branch_total`。若未来作为正式数据源，须以 `simulator="rv32_emulator_fast"` 独立字段呈现，不与 TinyFive 混算。
 - `estimate_cnn_instructions` 的 per-MAC 常量（`CONV_INSNS_PER_MAC=8` 等）属解析模型，禁止用于 `measured`。
 
@@ -399,7 +402,7 @@ make test
 
 | # | 风险 | 影响 | 缓解/回退 |
 |---|------|------|-----------|
-| R1 | TinyFive 吞吐低（Python 解释执行），全量 18.5 亿指令可能需数小时 | 全量不可行 | `--max-instructions` 预算并如实标注；先跑 1M 探测得到 MIPS 预估墙钟，写入 `warnings` |
+| R1 | TinyFive 吞吐低（Python 解释执行），全量 18.5 亿指令可能需数小时 | 全量不可行 | `--max-instructions` 预算并如实标注；**未实现自动预估**（无 1M 探测/`estimate_cnn_model` 接入），full 模式启动前只写一条“无自动预估、可用预算校准”的 warning；超时/预算中断的结果标 `partial` |
 | R2 | 256MiB numpy 内存 + 26MB 权重 | 内存压力 | 布局不可压缩（ABI 地址固定）；内存不足只能拒绝并提示，禁止缩容假装成功 |
 | R3 | `ra` 被生成代码内部 `jal ra, …` 覆盖，`halt_addr` 永不命中 | 无法 `halted` | `completion` 如实标 `budget_exhausted/timeout`；`--fail-on-incomplete` 供 CI |
 | R4 | 平台无 `SIGALRM` | 超时保护缺失 | 退化为要求 `--max-instructions`；否则拒绝启动 |
@@ -443,5 +446,6 @@ make test
 ### 已知限制
 
 - 对 TinyFive 机器实例的 NumPy 2.x `LW/LH` 兼容 shim 属课题 26 追修（`tinyfive.py` 未改）。
-- 错误路径统一用 `source=unavailable` 表达（而非 `dynamic=null`）。
-- LLVM 侧无 llvmlite 时 `status=skipped`、不打印比值数字。
+- 停机采用实例级 `exe` 重绑 shim（`halt_addr` 与指令预算先到者停），同样未改 `tinyfive.py`；设计文档 2.1.4 已登记该机制。
+- 错误路径统一用 `source=unavailable` 表达（而非 `dynamic=null`），`output.partial=true`。
+- LLVM 侧无 llvmlite 时 `status=skipped`；导入后目标机/IR 失败为 `status=failed` 并带真实 `reason`（main 写 warning）。两种情况都不打印比值数字。

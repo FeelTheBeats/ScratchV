@@ -63,7 +63,7 @@ completion  ::= "halted" | "budget_exhausted" | "timeout" | "error" | "not_run"
 规则：
 
 - `--max-instructions 0` 与 `--full` 等价，均为无截断语义；`limit=null`、`executed` 为真实执行数。
-- 分块循环使用 `--chunk-instructions`（默认 10,000,000）作为每块大小；块间检查停机与超时。这是在不修改 `ProfiledMachine` 公共接口的前提下获得“停机检测 + 进度 + 超时”的唯一手段。
+- 分块循环使用 `--chunk-instructions`（默认 10,000,000）作为每块大小；块间检查停机、墙钟与预算。块内精确停机由实例级 `exe` shim（2.1.4）保证，两者都不修改 `ProfiledMachine` 公共接口。
 - `budget_exhausted` 时 `executed == limit` 必须为等式不变量；`halted` 时 `limit` 可为 `null`（full）或任意（budgeted 提前停机）。
 - 超时只在 `--full` 模式下产生 `timeout`；`budgeted` 模式下先到限额即结束，超时属于异常保护（同样标 `timeout`）。
 - 派生指标约束：`comparison.dynamic_instruction_ratio` 仅当两侧 `source=="simulated"` 且 `completion=="halted"` 时计算；任一 `budget_exhausted/timeout` 一律 `null` 并写 `incomparable_reason`。
@@ -109,17 +109,19 @@ data_size    ::= len(weight_bytes) = len(.bin) − data_offset
 
 #### 2.1.4 停机条件
 
-- 生成代码结尾为 `_done: ret`（`jalr x0, x1, 0`，`onnx_to_riscv_standalone.py:1553-1556`）。harness 在运行前设 `x1 = halt_addr`，当 PC 到达 `halt_addr` 即判定 `halted`。TinyFive 的 `exe(start, end)` 原生支持按 end 地址停止；`ProfiledMachine` 未暴露该参数，故采用 2.1.1 的分块 `instructions=` 循环 + 每块后检查 `m.pc`。
+- 生成代码结尾为 `_done: ret`（`jalr x0, x1, 0`，`onnx_to_riscv_standalone.py:1553-1556`）。harness 在运行前设 `x1 = halt_addr`，当 PC 到达 `halt_addr` 即判定 `halted`。
+- TinyFive 的 `exe(start, end)` 原生支持按 end 地址停止，但 `ProfiledMachine` 未暴露该参数，且其 `exe` 在给定 `end` 时会忽略 `instructions` 预算。harness 因此只对**机器实例**重绑 `exe`：每步执行前同时检查 `pc == halt_addr` 与指令额度，二者先到者停（`_install_tinyfive_compat`，`rv32_bench.py`）；`scratchv/simulator/tinyfive.py` 与 `ProfiledMachine` 公共接口保持不变。
+- 外层仍以 2.1.1 的分块 `m.run(instructions=chunk, start=pc, strict=True)` 循环驱动，块间做墙钟检查、预算记账与 `pc` 复核；实例级 shim 保证单块内不会越过停机地址空转解码（否则每次解码都会计入 `ops.total`，虚增动态计数）。
 - 若生成代码在返回前用 `jal ra, …` 覆盖了 `ra`，或跳转路径异常，PC 永远不会命中 `halt_addr`：`budgeted` 记 `budget_exhausted`，`full` 记 `timeout`。不得谎报 `halted`。
 - TinyFive 遇到不支持的指令时打印错误且 PC 不前进（`dec()` 无匹配分支时不调用 `ipc()`），会表现为“卡死”。启动前必须做**助记符白名单预检**：用 ScratchV 的 `_disasm_one` 解析每个 code word，若出现 TinyFive 不支持/无法识别的助记符 → `completion="not_run"`，`exit 4`，禁止开跑。
-- `m.last_error` 非空（适配器捕获到异常）→ `completion="error"`，`dynamic` 整体置 `null`。
+- `m.last_error` 非空（适配器捕获到异常）→ `completion="error"`，该侧 `dynamic.source="unavailable"`、`ops=null`。
 
 #### 2.1.5 超时与预算保护
 
 - `--timeout SECONDS`（默认 900）为单侧仿真墙钟上限。实现：主线程 `signal.setitimer(ITIMER_REAL, remaining)` + `SimulationTimeout` 处理器；`m.run(..., strict=True)` 使适配器 `finally` 仍在异常路径更新 `instr_count`，ops 计数器保留部分值。
 - 超时判定不依赖异常类型（适配器会把异常包装成 `RuntimeError`）：置模块级 `_timed_out` 标志，捕获后据此写 `completion="timeout"`，并把 `elapsed_s`、`executed` 落盘。
 - 平台不支持 `SIGALRM`（如 Windows）时：`--timeout` 退化为告警，要求用户必须给 `--max-instructions`；否则拒绝启动并提示替代方案。
-- **预算预估仅作告警**：`benchmark.estimate_cnn_model()` 的输出只能进入 `warnings` 与 “预计墙钟” 提示，字段名带 `estimated_` 前缀，绝不填入 `dynamic`。
+- **不做自动预估**：本驱动不运行 1M 探测，也不调用 `benchmark.estimate_cnn_model()`（该解析模型只属于 `benchmark.py` 自身 CLI），因此报告中不存在 `estimated_*` 墙钟数字。full 模式启动前只在 `warnings` 写一条显式提示：无自动预估、可用 `--max-instructions N` 校准、墙钟超时触发时结果如实标 partial。若未来引入任何预估值，字段名必须带 `estimated_` 前缀，且绝不填入 `dynamic`。
 
 ### 2.2 诚实报告规范
 
@@ -437,7 +439,8 @@ while True:
       "per_label_note": "tinyfive exe() exposes no per-PC trace",
       "last_error": null
     },
-    "output": {"addr": 201326592, "elements": 1, "raw_hex": "0x00018000", "q16_16": 1.5}
+    "output": {"addr": 201326592, "elements": 1, "raw_hex": "0x00018000",
+               "q16_16": [1.5], "completion": "halted", "partial": false}
   },
   "llvm": {
     "compile": {"status": "skipped", "reason": "llvmlite not available",
@@ -452,7 +455,7 @@ while True:
     "incomparable_reason": "llvm.dynamic.source=='unavailable'"
   },
   "warnings": [
-    "estimated dynamic instructions (analytical): 1.85e9 — used for wall-clock warning only"
+    "full simulation requested; no automatic instruction-count or wall-clock estimate is available (use --max-instructions N to calibrate); results are marked partial if the wall-clock timeout fires"
   ],
   "errors": []
 }
