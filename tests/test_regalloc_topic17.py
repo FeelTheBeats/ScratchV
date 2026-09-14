@@ -462,6 +462,437 @@ class TestFunctionFrameAllocator:
 
 
 # ---------------------------------------------------------------------------
+# 3b. Regression tests: F1 frame accounting, F2 stale owners, F3 dynamic s-reg
+# ---------------------------------------------------------------------------
+
+def _machine_li(dst: str, imm: int) -> MachineInstr:
+    return MachineInstr(MachineOp.LI, MachineOperand.vreg(dst),
+                        MachineOperand.immediate(imm))
+
+
+def _machine_mv(reg: str, vreg: str) -> MachineInstr:
+    return MachineInstr(MachineOp.MV, MachineOperand.reg(reg),
+                        MachineOperand.vreg(vreg))
+
+
+def _machine_add(dst: str, a: str, b: str) -> MachineInstr:
+    return MachineInstr(MachineOp.ADD, MachineOperand.vreg(dst),
+                        MachineOperand.vreg(a), MachineOperand.vreg(b))
+
+
+def _machine_label(name: str) -> MachineInstr:
+    return MachineInstr(MachineOp.LABEL, comment=name)
+
+
+def _machine_j(target: str) -> MachineInstr:
+    return MachineInstr(MachineOp.J, comment=target)
+
+
+def _machine_call(target: str) -> MachineInstr:
+    return MachineInstr(MachineOp.CALL, comment=target)
+
+
+def _machine_ret() -> MachineInstr:
+    return MachineInstr(MachineOp.JALR, MachineOperand.reg("zero"),
+                        MachineOperand.reg("ra"), comment="ret")
+
+
+def _two_reg_factory(*, stack_base, pre_spilled, slot_hints):
+    return LinearScanAllocator(
+        phys_regs=["t0", "t1"], stack_base=stack_base,
+        pre_spilled=pre_spilled, slot_hints=slot_hints, strict=True,
+    )
+
+
+def _three_reg_factory(*, stack_base, pre_spilled, slot_hints):
+    return LinearScanAllocator(
+        phys_regs=["t0", "t1", "t2"], stack_base=stack_base,
+        pre_spilled=pre_spilled, slot_hints=slot_hints, strict=True,
+    )
+
+
+def _function_section(text: str, name: str) -> str:
+    """Lines of one function (its label plus body) up to the next function."""
+    out: list[str] = []
+    keep = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if keep and stripped.endswith(":") and not stripped.startswith("."):
+            break
+        if stripped == f"{name}:":
+            keep = True
+        if keep:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _function_body(text: str, name: str) -> str:
+    """Function section without assembler directives (for the emulator)."""
+    lines = [
+        line for line in _function_section(text, name).splitlines()
+        if not line.strip().startswith(
+            (".size", ".globl", ".type", ".text", ".align", ".section"))
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _spill_accesses(instrs) -> list[tuple[str, int]]:
+    """All ``(comment, offset)`` of allocator-inserted ``(sp)`` accesses."""
+    out: list[tuple[str, int]] = []
+    for instr in instrs:
+        if not instr.comment.startswith(_INSERTED_MARKERS):
+            continue
+        for op in (instr.dst, instr.src1, instr.src2):
+            if op is not None and op.kind == "mem":
+                match = re.match(r"(-?\d+)\((\w+)\)$", str(op.value))
+                if match and match.group(2) == "sp":
+                    out.append((instr.comment, int(match.group(1))))
+    return out
+
+
+def _reload_pressure_program() -> list[MachineInstr]:
+    """F1 repro: pass-1 records 12 bytes, pass-2 reload eviction needs 16.
+
+    The function contains a ``call`` so its frame also has to save ``ra``;
+    with a pass-1-sized frame the fourth spill slot collides with the saved
+    ``ra`` slot.
+    """
+    prog = [_machine_label("foo")]
+    for i in range(5):
+        prog.append(_machine_li(f"v{i}", i + 1))
+    for vreg in ("v1", "v0", "v1", "v2", "v3", "v4"):
+        prog.append(_machine_mv("a0", vreg))
+    prog += [
+        _machine_call("bar"),
+        _machine_ret(),
+        _machine_label("bar"),
+        _machine_ret(),
+    ]
+    return prog
+
+
+def _double_reload_program() -> list[MachineInstr]:
+    """F2 repro: one instruction with two spilled sources and a full pool.
+
+    ``d``, ``wA`` and ``wB`` fill the whole 3-register pool; both operands
+    of ``add d, v0, v1`` must be reloaded, each evicting a distinct victim.
+    """
+    prog = [
+        _machine_label("foo"),
+        _machine_li("v0", 11),
+        _machine_li("v1", 22),
+        _machine_j(".L1"),
+        _machine_label(".L1"),
+        _machine_li("d", 1),
+        _machine_li("w2", 5),
+        _machine_li("w3", 6),
+        _machine_mv("a1", "w2"),
+        _machine_mv("a1", "w3"),
+        _machine_li("wA", 7),
+        _machine_li("wB", 8),
+        _machine_add("d", "v0", "v1"),
+        _machine_mv("a1", "wA"),
+        _machine_mv("a1", "wB"),
+        _machine_mv("a1", "d"),
+        _machine_ret(),
+    ]
+    return prog
+
+
+def _dynamic_sreg_program() -> list[MachineInstr]:
+    """F3 repro: 15 locals fill a0-t6, so the reload of the cross-block
+    ``v0`` lands on ``s0`` even though pass 1 never allocated it."""
+    prog = [
+        _machine_label("foo"),
+        _machine_li("v0", 1),
+        _machine_j(".L1"),
+        _machine_label(".L1"),
+    ]
+    for i in range(15):
+        prog.append(_machine_li(f"w{i}", i + 1))
+    prog.append(_machine_mv("a0", "v0"))
+    for i in range(15):
+        prog.append(_machine_mv("a0", f"w{i}"))
+    prog.append(_machine_ret())
+    return prog
+
+
+def _call_multi_return_program() -> list[MachineInstr]:
+    """A caller with one ``call`` and two return points plus a callee."""
+    return [
+        _machine_label("main"),
+        _machine_li("v0", 1),
+        MachineInstr(MachineOp.BNEZ, MachineOperand.vreg("v0"),
+                     comment=".Lret1"),
+        _machine_call("foo"),
+        _machine_ret(),
+        _machine_label(".Lret1"),
+        _machine_ret(),
+        _machine_label("foo"),
+        _machine_ret(),
+    ]
+
+
+class TestFrameLayoutRegression:
+    def test_reload_eviction_slots_are_reserved_before_saved_ra(self):
+        """F1: the frame must cover pass-2 reload-eviction slots; the old
+        pass-1 accounting overlapped the fourth slot with the saved ra."""
+        fa = FunctionFrameAllocator(alloc_factory=_two_reg_factory)
+        allocated = fa.allocate_program(_reload_pressure_program())
+        info = fa.last_frame_info["foo"]
+
+        assert info.frame_size == 32
+        assert info.ra_offset == 28
+        accesses = _spill_accesses(allocated)
+        assert accesses, "expected reload/eviction spill code"
+        assert max(off for _, off in accesses) == 12  # v4 eviction slot
+        assert all(off < info.ra_offset for _, off in accesses)
+
+        text = AsmEmitter(allocated).emit()
+        assert "sw ra, 28(sp)" in text
+        assert f"lw ra, {info.ra_offset}(sp)" in text
+
+    def test_spill_bounds_check_rejects_access_outside_the_spill_area(self):
+        """F1 backstop: emitted spill offsets must stay in [0, spill_bytes)."""
+        inside = MachineInstr(MachineOp.SW, MachineOperand.reg("t0"),
+                              MachineOperand.mem(12), comment="reload v9")
+        FunctionFrameAllocator._check_spill_bounds([[inside]], 16)
+
+        outside = MachineInstr(MachineOp.SW, MachineOperand.reg("t0"),
+                               MachineOperand.mem(64), comment="reload v9")
+        with pytest.raises(RegAllocError):
+            FunctionFrameAllocator._check_spill_bounds([[outside]], 16)
+
+
+class TestRuntimeEvictionRegression:
+    def test_double_spilled_operands_evict_distinct_victims(self):
+        """F2: a stale owners snapshot used to evict wB twice, clobbering
+        its slot and binding both reloads to one register."""
+        fa = FunctionFrameAllocator(alloc_factory=_three_reg_factory)
+        allocated = fa.allocate_program(_double_reload_program())
+        text = AsmEmitter(allocated).emit()
+
+        assert text.count("evict wB") == 1
+        assert "evict wA" in text
+
+        add_line = next(
+            line for line in text.splitlines()
+            if re.match(r"\s*add\s", line))
+        match = re.match(r"\s*add\s+(\w+),\s*(\w+),\s*(\w+)", add_line)
+        assert match is not None, add_line
+        assert match.group(2) != match.group(3)  # I2: distinct sources
+        _assert_hygiene(text)
+
+    def test_double_spilled_operands_execute_correctly(self):
+        """F2 end-to-end: ``d = v0 + v1`` must be 33, not 44."""
+        from scratchv.backend.riscv_encoder import assemble_to_binary
+        from scratchv.simulator.rv32_emulator import RV32Emulator
+
+        fa = FunctionFrameAllocator(alloc_factory=_three_reg_factory)
+        text = AsmEmitter(fa.allocate_program(_double_reload_program())).emit()
+        body = _function_body(text, "foo")
+
+        emu = RV32Emulator()
+        emu.load_code(bytes(assemble_to_binary(body)))
+        emu.run(max_instr=1000)
+
+        assert emu.regs[11] == 33  # a1 <- d = v0 + v1 = 11 + 22
+        assert emu.regs[2] == RV32Emulator.STACK_TOP  # sp balanced
+
+    def test_select_victim_skips_spilled_and_uses_owners_register(self):
+        """F2 unit: already-spilled vregs are not evictable and the victim
+        register comes from the live ownership map, not ``alloc_map``."""
+        alloc = LinearScanAllocator(phys_regs=["t0", "t1"])
+        alloc._vreg_interval = {
+            "x": LiveInterval("x", 0, 10, {9}),
+            "y": LiveInterval("y", 0, 10, {9}),
+        }
+        alloc.alloc_map = {
+            "x": "SPILL_x",  # stale mapping: x still lives in t0
+            "y": "t1",
+        }
+        alloc._spilled = {"y"}
+        inst = LsInstruction(5, "add", ["v9", "z", "w"],
+                             defines={"v9"}, uses={"z", "w"})
+
+        picked = alloc._select_victim(
+            inst, owners={"t0": "x", "t1": "y"}, used={"t0", "t1"})
+        assert picked == ("x", "t0")
+
+    def test_reload_never_targets_an_instruction_operand_register(self):
+        """I4: a reload must not clobber a physical operand of the same
+        instruction (e.g. the ``a0`` of ``add v2, a0, v1``)."""
+        alloc = LinearScanAllocator(phys_regs=["a0", "t0"])
+        alloc._vreg_interval = {"x": LiveInterval("x", 0, 10, {9})}
+        alloc.alloc_map = {"x": "t0"}
+        alloc._spill_slots = {"v1": 0}
+        alloc.stack_slot = 4
+        inst = LsInstruction(3, "add", ["v2", "a0", "v1"],
+                             defines={"v2"}, uses={"v1"})
+
+        reg, stores = alloc._pick_reload_reg(
+            inst, "v1", 0, {}, owners={"t0": "x"}, loaded={})
+        assert reg == "t0"
+        assert stores == ["  sw t0, 4(sp)  # evict x for reload"]
+        assert "x" in alloc._spilled
+
+    def test_operand_alias_check_raises_i2_for_distinct_sources(self):
+        """F7: output-time I2 check catches two distinct sources aliasing
+        while still allowing a definition to share a source register (I3)."""
+        alloc = LinearScanAllocator(phys_regs=["t0", "t1"])
+        inst = LsInstruction(3, "add", ["v3", "v0", "v1"],
+                             defines={"v3"}, uses={"v0", "v1"})
+
+        with pytest.raises(RegisterAliasError):
+            alloc._check_operand_aliases(inst, ["t0", "t1", "t1"])
+        alloc._check_operand_aliases(inst, ["t0", "t0", "t1"])
+
+
+class TestDynamicCalleeSavedRegression:
+    def test_dynamically_selected_s_register_is_saved(self):
+        """F3: a reload target picked during emission must appear in the
+        generated save set (previously only the pass-1 alloc_map was used)."""
+        fa = FunctionFrameAllocator()  # default 27-register pool
+        allocated = fa.allocate_program(_dynamic_sreg_program())
+        info = fa.last_frame_info["foo"]
+
+        assert "s0" in info.saved_offsets
+        offset = info.saved_offsets["s0"]
+        text = AsmEmitter(allocated).emit()
+        assert f"sw s0, {offset}(sp)" in text
+        assert f"lw s0, {offset}(sp)" in text
+
+        mentioned = {
+            str(op.value)
+            for instr in allocated
+            for op in (instr.dst, instr.src1, instr.src2)
+            if op is not None and op.kind == "reg"
+            and str(op.value) in mt.CALLEE_SAVED
+        }
+        assert mentioned <= set(info.saved_offsets)
+        _assert_hygiene(text)
+
+    def test_dynamically_selected_s_register_is_restored(self):
+        """F3 end-to-end: s0 sentinel survives the frame's execution."""
+        from scratchv.backend.riscv_encoder import assemble_to_binary
+        from scratchv.simulator.rv32_emulator import RV32Emulator
+
+        fa = FunctionFrameAllocator()
+        text = AsmEmitter(fa.allocate_program(_dynamic_sreg_program())).emit()
+        body = _function_body(text, "foo")
+
+        emu = RV32Emulator()
+        emu.load_code(bytes(assemble_to_binary(body)))
+        emu.regs[8] = 0x5A5A  # s0 sentinel
+        emu.run(max_instr=2000)
+
+        assert emu.regs[8] == 0x5A5A  # restored by the epilogue
+        assert emu.regs[10] == 15     # last mv a0, w14
+        assert emu.regs[2] == RV32Emulator.STACK_TOP
+
+
+class TestAllocatorEdgeCases:
+    def test_empty_block_allocates_to_empty(self):
+        alloc = LinearScanAllocator(phys_regs=["t0"])
+        assert alloc.allocate_block([]) == []
+        assert alloc.emit([]) == ""
+
+    def test_single_instruction_block(self):
+        block = [LsInstruction(0, "li", ["v0", "1"], defines={"v0"})]
+        alloc = LinearScanAllocator(phys_regs=["t0"])
+        assert _lines(alloc.allocate_block(block)) == ["  li t0, 1"]
+
+    def test_non_strict_mode_counts_fallbacks_instead_of_raising(self):
+        """Measurement mode degrades with counters (no I2 raise) instead of
+        aborting, as required by the pressure benchmarks."""
+        alloc = LinearScanAllocator(phys_regs=["t0"], strict=False)
+        text = alloc.emit(_three_block())
+        assert alloc.fallback_count > 0
+        assert "SPILL_" not in text
+
+
+class TestW9Acceptance:
+    def test_ra_saved_once_and_restored_before_every_ret(self):
+        """F4: ra is saved by the prologue of a calling function and
+        restored on each of its return paths."""
+        fa = FunctionFrameAllocator()
+        allocated = fa.allocate_program(_call_multi_return_program())
+        assert set(fa.last_frame_info) == {"main", "foo"}
+        assert all(
+            info.frame_size % 16 == 0
+            for info in fa.last_frame_info.values())
+
+        main_info = fa.last_frame_info["main"]
+        assert main_info.ra_offset is not None
+        assert fa.last_frame_info["foo"].ra_offset is None
+        text = AsmEmitter(allocated).emit()
+        assert text.count("sw ra,") == 1
+        assert text.count("lw ra,") == 2  # two ret points in main
+
+        for _, offset in _spill_accesses(allocated):
+            assert offset < main_info.ra_offset
+
+    def test_function_sections_use_their_own_frame_size(self):
+        """F4: multi-function programs get independent frames and each
+        epilogue balances its own prologue adjustment."""
+        fa = FunctionFrameAllocator()
+        allocated = fa.allocate_program(_call_multi_return_program())
+        text = AsmEmitter(allocated).emit()
+
+        for name, info in fa.last_frame_info.items():
+            section = _function_section(text, name)
+            if info.frame_size == 0:
+                assert "addi sp, sp" not in section
+                continue
+            assert f"addi sp, sp, -{info.frame_size}" in section
+            restores = section.count(f"addi sp, sp, {info.frame_size}")
+            assert restores == section.count("jalr zero, ra")
+
+    def test_call_and_multi_return_path_executes_with_balanced_sp(self):
+        """F4: the fall-through/branch path through main's ret restores
+        ra and sp; the callee body does the same in isolation."""
+        from scratchv.backend.riscv_encoder import assemble_to_binary
+        from scratchv.simulator.rv32_emulator import RV32Emulator
+
+        fa = FunctionFrameAllocator()
+        allocated = fa.allocate_program(_call_multi_return_program())
+        text = AsmEmitter(allocated).emit()
+
+        for name in ("main", "foo"):
+            emu = RV32Emulator()
+            body = _function_body(text, name)
+            emu.load_code(bytes(assemble_to_binary(body)))
+            emu.run(max_instr=500)
+            assert emu.regs[2] == RV32Emulator.STACK_TOP
+
+    def test_linear_scan_deterministic(self):
+        """F4: two allocations of the same input are byte-identical."""
+        prog = _double_reload_program()
+
+        def allocate_once():
+            fa = FunctionFrameAllocator(alloc_factory=_three_reg_factory)
+            allocated = fa.allocate_program(prog)
+            snapshot = [
+                (instr.op.value, instr.dst, instr.src1, instr.src2,
+                 instr.comment)
+                for instr in allocated
+            ]
+            return snapshot, AsmEmitter(allocated).emit()
+
+        first, first_text = allocate_once()
+        second, second_text = allocate_once()
+        assert first == second
+        assert first_text == second_text
+
+        block = _seven_block()
+        a1 = LinearScanAllocator(phys_regs=["t0", "t1"])
+        a1.allocate(a1.compute_live_intervals(block))
+        a2 = LinearScanAllocator(phys_regs=["t0", "t1"])
+        a2.allocate(a2.compute_live_intervals(block))
+        assert a1.alloc_map == a2.alloc_map
+
+
+# ---------------------------------------------------------------------------
 # 4. Pipeline wiring / defaults
 # ---------------------------------------------------------------------------
 
@@ -495,6 +926,31 @@ class TestPipelineWiring:
         driver = CompilerDriver(CompilerConfig(reg_alloc="bogus"))
         with pytest.raises(ValueError):
             driver._generate_riscv_linear(_EmptyProgram())
+
+    def test_dag_path_rejects_linear_mode(self):
+        """F6: the DAG pipeline must not silently degrade linear to greedy."""
+        from scratchv.compiler import CompilerConfig, CompilerDriver
+
+        class _EmptyProgram:
+            functions: list = []
+
+        for mode in ("linear", "linear-v1.5"):
+            driver = CompilerDriver(
+                CompilerConfig(reg_alloc=mode, use_dag_isel=True))
+            with pytest.raises(ValueError, match="DAG"):
+                driver._generate_riscv_dag(_EmptyProgram())
+
+    def test_dag_path_rejects_unknown_mode(self):
+        """F6: unknown modes raise on the DAG path like on the linear one."""
+        from scratchv.compiler import CompilerConfig, CompilerDriver
+
+        class _EmptyProgram:
+            functions: list = []
+
+        driver = CompilerDriver(
+            CompilerConfig(reg_alloc="bogus", use_dag_isel=True))
+        with pytest.raises(ValueError, match="unknown reg_alloc mode"):
+            driver._generate_riscv_dag(_EmptyProgram())
 
     def test_linear_opt_in_end_to_end_forced_spill(self, tmp_path):
         from scratchv.backend.riscv_encoder import assemble_to_binary
