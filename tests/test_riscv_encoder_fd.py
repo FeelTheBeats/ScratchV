@@ -29,6 +29,14 @@ FD_SAMPLES = [
     "fcvt.d.s f0, f1",
     "fmv.x.w a0, f1",
     "li.d f0, 123",
+    # Fused / classified / Zfa families (Topic 28 review F6).
+    "fmadd.d f0, f1, f2, f3",
+    "fnmadd.d f0, f1, f2, f3",
+    "fmsub.s f0, f1, f2, f3",
+    "fnmsub.s f0, f1, f2, f3",
+    "fclass.s a0, f1",
+    "fli.s f0, 1",
+    "fround.s f0, f1",
 ]
 
 
@@ -62,6 +70,13 @@ def test_unknown_non_fd_still_value_error():
     ("fsqrt.s", True),
     ("fmv.x.w", True),
     ("fsgnjx.d", True),
+    ("fmadd.d", True),
+    ("fnmadd.d", True),
+    ("fmsub.s", True),
+    ("fnmsub.s", True),
+    ("fclass.s", True),
+    ("fli.s", True),
+    ("fround.s", True),
 ])
 def test_is_fd_mnemonic_predicate(mnemonic, expected):
     assert _is_fd_mnemonic(mnemonic) is expected
