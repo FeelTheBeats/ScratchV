@@ -59,7 +59,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--timeout", type=float, default=30.0,
-        help="Per-case timeout budget in seconds (default: 30)",
+        help="Per-case timeout budget in seconds for the execution oracle "
+        "(default: 30); caps each case's meta timeout_s",
     )
     parser.add_argument(
         "--filter", default=None,
@@ -138,6 +139,13 @@ def main(argv: list[str] | None = None) -> int:
 
 def _print_summary(report: SuiteReport, *, quiet: bool) -> None:
     summary = report.summary()
+    if summary["xpassed"]:
+        print(
+            f"warning: {summary['xpassed']} xpassed case(s) — declared "
+            "xfail stages now pass; remove the obsolete declaration or run "
+            "with --strict-xfail",
+            file=sys.stderr,
+        )
     if quiet:
         return
     print(

@@ -345,8 +345,9 @@ class SuiteReport:
             "",
             "## 数据缺口与缺陷登记",
             "",
-            "- C1 backend/asm-encoder: symbolic branch targets are emitted in "
-            "comments; affected assemble semantics stages are xfailed.",
+            "- C1 backend/regalloc: the linear-scan emitter keeps branch "
+            "targets in comments instead of operands (greedy path emits them "
+            "correctly); affected assemble/semantic stages are xfailed.",
             "- C2 backend/asm-emitter: constant materialisation emits invalid "
             "`mv rd, imm`.",
             "- C3 backend/regalloc: spill/reload stack slots read uninitialised "
@@ -814,6 +815,12 @@ def load_case_spec(dsl_path: Path, root: Path) -> CaseSpec:
         errors.append(
             "oracle/flow conflict: oracle=interpreter requires flow=linear"
         )
+    if oracle == ORACLE_INTERPRETER:
+        warnings.append(
+            "interpreter oracle validates DSL semantics only; generated "
+            "code is not executed (blind spots: C2 constant materialisation, "
+            "C4 op lowering, C5 float semantics)"
+        )
 
     inputs = _validate_inputs(meta.get("inputs", {}), errors)
     input_registers = _validate_input_registers(
@@ -984,11 +991,42 @@ _REG_NUMS: dict[str, int] = {
 }
 
 
-class ExecutionOracle:
-    """Execute assembled RISC-V and read the ``a0`` return register."""
+EXECUTION_MAX_STEPS: int = 100_000_000
 
-    def __init__(self, *, mem_size: int = 128 * 1024 * 1024) -> None:
+
+def _machine_pc(machine: Any) -> int:
+    """Read the PC, tolerating scalar and one-element-array TinyFive PCs.
+
+    ``ProfiledMachine.pc`` assumes the PC is indexable, which breaks after a
+    ``jalr`` stores a NumPy scalar (pre-existing simulator adapter issue).
+    The suite reads the raw attribute instead of touching ``scratchv/**``.
+    """
+    raw = machine._machine.pc
+    if hasattr(raw, "__len__"):
+        return int(raw[0])
+    return int(raw)
+
+
+class ExecutionOracle:
+    """Execute assembled RISC-V and read the ``a0`` return register.
+
+    Execution is stepped instruction by instruction so that loops run to
+    completion (the previous ``instructions=len(words)`` bound truncated any
+    dynamic execution longer than the static code size) while a real wall
+    clock ``timeout_s`` still bounds runaway programs.  The return address
+    register ``ra`` is preloaded with a sentinel just past the code, so the
+    compiler's ``jalr zero, ra`` epilogue halts the machine instead of
+    jumping back to address 0.
+    """
+
+    def __init__(
+        self,
+        *,
+        mem_size: int = 128 * 1024 * 1024,
+        max_steps: int = EXECUTION_MAX_STEPS,
+    ) -> None:
         self.mem_size = mem_size
+        self.max_steps = max_steps
 
     def available(self) -> bool:
         try:
@@ -1047,7 +1085,54 @@ class ExecutionOracle:
                         error=None,
                     )
                 machine.set_reg(_REG_NUMS[register], int(value))
-            machine.run(instructions=len(words), start=0, strict=True)
+            code_end = len(words) * 4
+            machine.set_reg(1, code_end)
+            steps = 0
+            while 0 <= _machine_pc(machine) < code_end:
+                if steps >= self.max_steps:
+                    return SemanticOutcome(
+                        ok=False, oracle=ORACLE_EXECUTION, expected=None,
+                        actual=machine.get_reg(10), duration_s=elapsed(),
+                        blocked_reason=None,
+                        error=(
+                            "execution step limit exceeded "
+                            f"({self.max_steps} instructions)"
+                        ),
+                    )
+                if elapsed() >= timeout_s:
+                    return SemanticOutcome(
+                        ok=False, oracle=ORACLE_EXECUTION, expected=None,
+                        actual=machine.get_reg(10), duration_s=elapsed(),
+                        blocked_reason=None,
+                        error=(
+                            f"execution timeout after {timeout_s:g}s "
+                            f"({steps} instructions executed)"
+                        ),
+                    )
+                pc_before = _machine_pc(machine)
+                machine.run(instructions=1, start=pc_before, strict=True)
+                steps += 1
+                if _machine_pc(machine) == pc_before:
+                    return SemanticOutcome(
+                        ok=False, oracle=ORACLE_EXECUTION, expected=None,
+                        actual=machine.get_reg(10), duration_s=elapsed(),
+                        blocked_reason=None,
+                        error=(
+                            "unsupported instruction at "
+                            f"pc={pc_before:#x} (decoder made no progress)"
+                        ),
+                    )
+            final_pc = _machine_pc(machine)
+            if final_pc != code_end:
+                return SemanticOutcome(
+                    ok=False, oracle=ORACLE_EXECUTION, expected=None,
+                    actual=machine.get_reg(10), duration_s=elapsed(),
+                    blocked_reason=None,
+                    error=(
+                        f"pc left the code region: {final_pc:#x} "
+                        f"(code_end={code_end:#x})"
+                    ),
+                )
             actual = machine.get_reg(10)
             return SemanticOutcome(
                 ok=None, oracle=ORACLE_EXECUTION, expected=None,
@@ -1313,11 +1398,13 @@ class DSLSuiteRunner:
             compile_outcome.asm_text,
             spec.input_registers,
             spec.inputs,
-            timeout_s=spec.timeout_s,
+            timeout_s=min(spec.timeout_s, self.timeout_s),
         )
         if outcome.ok is None and (
             outcome.blocked_reason or outcome.error
         ):
+            return replace(outcome, expected=spec.expected_return)
+        if outcome.ok is False and outcome.error:
             return replace(outcome, expected=spec.expected_return)
         ok = compare_values(
             outcome.actual, spec.expected_return,
@@ -1480,14 +1567,19 @@ class DSLSuiteRunner:
             (stage, message)
             for stage, message in blocked if stage in xfail_stages
         ]
+        blocked_uncovered = [
+            (stage, message)
+            for stage, message in blocked if stage not in xfail_stages
+        ]
 
         status = STATUS_PASS
         error_stage: str | None = None
         error: str | None = None
-        if hard:
+        if hard or blocked_uncovered:
             status = STATUS_FAIL
             error_stage, error = min(
-                hard, key=lambda item: stage_order[item[0]],
+                hard + blocked_uncovered,
+                key=lambda item: stage_order[item[0]],
             )
         elif covered or blocked_covered:
             status = STATUS_XFAIL

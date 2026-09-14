@@ -21,8 +21,8 @@
       "budget",
       "semantic"
     ],
-    "reason": "RISCVAEncoder cannot encode symbolic branch targets (C1); first bad line: bge a3, 10  # .Lloop_exit_3",
-    "owner": "backend/asm-encoder",
+    "reason": "C1 backend/regalloc: the linear-scan emitter keeps the branch target in the instruction comment and emits no operand, so assemble_to_binary fails; greedy path encodes the same branch. first bad line: bge a3, 10  # .Lloop_exit_3",
+    "owner": "backend/regalloc",
     "strict": false
   }
 }
