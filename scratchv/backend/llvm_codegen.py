@@ -206,6 +206,8 @@ class LLVMCodegen:
         }
 
         self._infer_function_params(func)
+        self._validate_return_types(func)
+        self._check_unbounded_loops(func)
 
         used_names: set[str] = set()
         params: list[str] = []
@@ -270,6 +272,112 @@ class LLVMCodegen:
                     return self._value_type(instr.operands[0])
         return "void"
 
+    def _validate_return_types(self, func: Function) -> None:
+        """Reject mixed ``ret <value>`` / ``ret void`` (illegal LLVM IR).
+
+        ``_first_ret_type`` can only patch the emitted signature to one of
+        the two forms, so a function containing both produces a module that
+        ``llvm-as`` refuses. Fail loudly instead.
+        """
+        has_void = False
+        value_types: set[str] = set()
+        for block in func.blocks:
+            for instr in block.instructions:
+                if instr.opcode is not OpCode.RETURN:
+                    continue
+                if instr.operands:
+                    value_types.add(self._value_type(instr.operands[0]))
+                else:
+                    has_void = True
+        if has_void and value_types:
+            raise LLVMCodegenError(
+                f"function {func.name}: void 'ret' mixed with value return "
+                f"{sorted(value_types)}; make all returns uniform"
+            )
+        if len(value_types) > 1:
+            raise LLVMCodegenError(
+                f"function {func.name}: inconsistent return types "
+                f"{sorted(value_types)}"
+            )
+
+    def _check_unbounded_loops(self, func: Function) -> None:
+        """Reject structured loops whose condition can never change.
+
+        The DSL frontend keeps a fresh ``Value`` per assignment (no phi /
+        alloca-based variable identity), so re-assigning a ``while``
+        condition variable never updates the slot the header reads. Such a
+        loop cannot terminate and would hang ``lli`` or any consumer; fail
+        loudly instead of emitting a silently-broken loop.
+        """
+        blocks = {b.name: b for b in func.blocks}
+        for name, block in blocks.items():
+            if not block.instructions:
+                continue
+            br_if = block.instructions[-1]
+            if br_if.opcode is not OpCode.BR_IF or not br_if.attrs.get("cmp_op"):
+                continue
+            targets = [
+                t.strip() for t in (br_if.target or "").split(",") if t.strip()
+            ]
+            if len(targets) < 2:
+                continue
+            body_name, exit_name = targets[0], targets[1]
+            stack = [body_name]
+            region: set[str] = set()
+            back_edge = False
+            while stack:
+                current = stack.pop()
+                if current == name:
+                    back_edge = True
+                    continue
+                if current in region or current == exit_name:
+                    continue
+                if current not in blocks:
+                    continue
+                region.add(current)
+                inner = blocks[current]
+                if not inner.instructions:
+                    continue
+                term = inner.instructions[-1]
+                if term.opcode is OpCode.BR and term.target:
+                    stack.append(term.target.strip())
+                elif term.opcode is OpCode.BR_IF:
+                    stack.extend(
+                        t.strip() for t in (term.target or "").split(",")
+                        if t.strip()
+                    )
+            if not back_edge:
+                continue
+            has_return = any(
+                instr.opcode is OpCode.RETURN
+                for block_name in region
+                for instr in blocks[block_name].instructions
+            )
+            if has_return:
+                continue
+            cond_names = [
+                v.name for v in br_if.operands
+                if not v.is_constant and v.const_value is None
+            ]
+            defined = {
+                instr.dest.name
+                for block_name in region
+                for instr in blocks[block_name].instructions
+                if instr.dest is not None
+            }
+            if not any(n in defined for n in cond_names):
+                reason = (
+                    "its condition operands are constant"
+                    if not cond_names
+                    else f"condition operands {cond_names} are not modified "
+                         f"in the loop body"
+                )
+                raise LLVMCodegenError(
+                    f"function {func.name}: loop at '{name}' can never exit "
+                    f"({reason}); DSL variables have static SSA semantics, "
+                    f"so reassigning a loop condition variable is unsupported"
+                )
+
     # ------------------------------------------------------------------
     # Basic blocks and control-flow state machine
     # ------------------------------------------------------------------
@@ -328,22 +436,12 @@ class LLVMCodegen:
         self._p(f"  store {ty} {reg}, {ty}* {slot}")
 
     def _emit_unsupported(self, instr: Instruction) -> None:
-        self._p(f"  ; fallback: {instr.opcode.value} not lowered")
-        if instr.dest is None:
-            return
-        base = _llvm_type(instr.dest.dtype)
-        if self._is_pointer_value(instr.dest):
-            count = 1
-            for dim in instr.dest.shape:
-                count *= max(1, int(dim))
-            self._dest_buffer(instr, count, base)
-            return
-        dst = self._dest(instr)
-        if base in _FLOAT_TYPES:
-            self._p(f"  {dst} = fadd {base} 0.0, 0.0")
-        else:
-            self._p(f"  {dst} = add {base} 0, 0")
-        self._ref_types[dst] = base
+        """Fail loudly: silently approximating an op would corrupt results."""
+        raise LLVMCodegenError(
+            f"opcode not lowered by the LLVM backend: "
+            f"{instr.opcode.value} (destination "
+            f"{instr.dest.name if instr.dest else '<none>'})"
+        )
 
     # ------------------------------------------------------------------
     # Naming / value binding helpers
@@ -360,9 +458,20 @@ class LLVMCodegen:
         self._ref_types[ref] = llvm_ty
 
     def _dest(self, instr: Instruction) -> str:
-        """Get or create an LLVM register for the instruction's destination."""
+        """Get or create an LLVM register for a scalar destination.
+
+        Tensor destinations must be lowered through :meth:`_dest_buffer` (or
+        :meth:`_emit_map` for elementwise ops); requesting a scalar register
+        for a shaped value would emit illegal IR, so it fails loudly.
+        """
         if instr.dest is None:
             return ""
+        if (self._is_pointer_value(instr.dest)
+                and instr.opcode is not OpCode.ALLOCA):
+            raise LLVMCodegenError(
+                f"{instr.opcode.value}: tensor destination "
+                f"'{instr.dest.name}' requires buffer lowering"
+            )
         name = instr.dest.name
         if name in self._named_values:
             return self._named_values[name]
@@ -411,9 +520,7 @@ class LLVMCodegen:
             return _llvm_const(val)
         base = _llvm_type(val.dtype)
         if self._is_pointer_value(val):
-            count = 1
-            for dim in val.shape:
-                count *= max(1, int(dim))
+            count = self._shape_count(val)
             ptr = self._alloc_slot(base, count, "tbuf")
             self._bind(val.name, ptr, base + "*")
             return ptr
@@ -432,6 +539,49 @@ class LLVMCodegen:
 
     def _is_pointer_value(self, val: Value) -> bool:
         return bool(val.shape) or val.name in self._ptr_names
+
+    @staticmethod
+    def _shape_count(val: Value) -> int:
+        """Element count denoted by a value's shape (at least 1)."""
+        count = 1
+        for dim in val.shape:
+            count *= max(1, int(dim))
+        return count
+
+    def _is_tensor_operand(self, val: Value) -> bool:
+        """Whether ``val`` is backed by a buffer (constants are scalars)."""
+        if val.is_constant and val.const_value is not None:
+            return False
+        return self._is_pointer_value(val)
+
+    def _require_elements(self, instr: Instruction, idx: int,
+                          needed: int, what: str) -> None:
+        """Fail loudly when an operand cannot supply ``needed`` elements.
+
+        Scalar operands are spilled to a single-element buffer by
+        :meth:`_ptr_of`; letting a tensor loop run past that buffer would be
+        an out-of-bounds read, so multi-element requests on scalars (and
+        under-sized shaped operands) are rejected.
+        """
+        if idx >= len(instr.operands):
+            raise LLVMCodegenError(
+                f"missing operand {idx} for {instr.opcode.value}"
+            )
+        val = instr.operands[idx]
+        if not self._is_tensor_operand(val):
+            if needed > 1:
+                raise LLVMCodegenError(
+                    f"{instr.opcode.value}: scalar operand '{val.name}' "
+                    f"cannot supply {needed} elements for {what}; pass a "
+                    f"value with a shape"
+                )
+            return
+        available = self._shape_count(val)
+        if available < needed:
+            raise LLVMCodegenError(
+                f"{instr.opcode.value}: operand '{val.name}' has "
+                f"{available} element(s) but {what} needs {needed}"
+            )
 
     def _type_of_operand(self, instr: Instruction, idx: int) -> str:
         if idx >= len(instr.operands):
@@ -502,6 +652,53 @@ class LLVMCodegen:
             return pty[:-1]
         return fallback
 
+    def _emit_map(self, instr: Instruction, apply) -> None:
+        """Lower an elementwise op whose destination carries a shape.
+
+        Each element of the destination is computed by calling ``apply`` with
+        the per-element operand refs; shaped operands are indexed element by
+        element, scalar operands are broadcast.
+        """
+        assert instr.dest is not None
+        count = self._shape_count(instr.dest)
+        ty = _llvm_type(instr.dest.dtype)
+        broadcast: set[int] = set()
+        for idx, val in enumerate(instr.operands):
+            if not self._is_tensor_operand(val):
+                continue
+            available = self._shape_count(val)
+            if available not in (1, count):
+                raise LLVMCodegenError(
+                    f"{instr.opcode.value}: operand '{val.name}' has "
+                    f"{available} element(s), destination needs {count}"
+                )
+            if available == 1 and count > 1:
+                broadcast.add(idx)
+        if ty not in _FLOAT_TYPES and instr.opcode in (
+                OpCode.EXP, OpCode.GELU, OpCode.SIGMOID):
+            raise LLVMCodegenError(
+                f"{instr.opcode.value}: integer tensor destinations are not "
+                f"supported"
+            )
+        out = self._dest_buffer(instr, count, ty)
+        ctx = self._loop_open(count, None, "ew_i")
+        args: list[str] = []
+        for idx, val in enumerate(instr.operands):
+            if not self._is_tensor_operand(val):
+                args.append(self._operand_for(instr, idx, ty, "ew_s"))
+                continue
+            ptr = self._ptr_of(instr, idx, ty)
+            if idx in broadcast:
+                args.append(self._load(ty, ptr, "ew_v"))
+            else:
+                elem = self._gep(ty, ptr, ctx.value, "ew_p")
+                args.append(self._load(ty, elem, "ew_v"))
+        result = apply(args)
+        out_ptr = self._gep(ty, out, ctx.value, "ew_o")
+        self._p(f"  store {ty} {result}, {ty}* {out_ptr}")
+        self._loop_close(ctx)
+        self._finalize_from_buffer(instr, out, ty)
+
     def _materialize_const(self, value: float | int, ty: str,
                            hint: str) -> str:
         reg = self._fresh(hint)
@@ -571,6 +768,13 @@ class LLVMCodegen:
         self._ref_types[reg] = ty
         return reg
 
+    def _un(self, op: str, ty: str, src, hint: str) -> str:
+        reg = self._fresh(hint)
+        self._namer.register_definition(reg)
+        self._p(f"  {reg} = {op} {ty} {src}")
+        self._ref_types[reg] = ty
+        return reg
+
     def _call_math(self, name: str, ty: str, arg: str, hint: str) -> str:
         fn = name + ("f" if ty == "float" else "")
         reg = self._fresh(hint)
@@ -626,10 +830,16 @@ class LLVMCodegen:
 
     def _emit_binary(self, instr: Instruction, fop: str, iop: str) -> None:
         ty = self._infer_type(instr)
+        op = fop if ty in _FLOAT_TYPES else iop
+        if instr.dest is not None and self._is_pointer_value(instr.dest):
+            self._emit_map(
+                instr,
+                lambda args: self._bin(op, ty, args[0], args[1], "ew_b"),
+            )
+            return
         lhs = self._operand_for(instr, 0, ty, "cvt_l")
         rhs = self._operand_for(instr, 1, ty, "cvt_r")
         dst = self._dest(instr)
-        op = fop if ty in _FLOAT_TYPES else iop
         self._p(f"  {dst} = {op} {ty} {lhs}, {rhs}")
 
     def _emit_add(self, instr: Instruction) -> None:
@@ -646,6 +856,14 @@ class LLVMCodegen:
 
     def _emit_neg(self, instr: Instruction) -> None:
         ty = self._infer_type(instr)
+        if instr.dest is not None and self._is_pointer_value(instr.dest):
+            self._emit_map(
+                instr,
+                lambda args: self._un("fneg", ty, args[0], "ew_n")
+                if ty in _FLOAT_TYPES
+                else self._bin("sub", ty, 0, args[0], "ew_n"),
+            )
+            return
         src = self._operand_for(instr, 0, ty, "cvt")
         dst = self._dest(instr)
         if ty in _FLOAT_TYPES:
@@ -655,6 +873,12 @@ class LLVMCodegen:
 
     def _emit_exp(self, instr: Instruction) -> None:
         ty = self._infer_type(instr)
+        if instr.dest is not None and self._is_pointer_value(instr.dest):
+            self._emit_map(
+                instr,
+                lambda args: self._call_math("exp", ty, args[0], "ew_e"),
+            )
+            return
         if ty in _FLOAT_TYPES:
             src = self._operand_for(instr, 0, ty, "cvt")
             dst = self._dest(instr)
@@ -859,9 +1083,7 @@ class LLVMCodegen:
             return
         value = self._load(ty, acc, "res")
         if self._is_pointer_value(instr.dest):
-            count = 1
-            for dim in instr.dest.shape:
-                count *= max(1, int(dim))
+            count = self._shape_count(instr.dest)
             buf = self._dest_buffer(instr, count, ty)
             self._p(f"  store {ty} {value}, {ty}* {buf}")
         else:
@@ -904,8 +1126,27 @@ class LLVMCodegen:
         except (TypeError, ValueError):
             return default
 
+    def _relu_scalar(self, ty: str, src: str) -> str:
+        reg = self._fresh("relu_r")
+        self._namer.register_definition(reg)
+        cmp_reg = self._fresh("cmp")
+        self._namer.register_definition(cmp_reg)
+        if ty in _FLOAT_TYPES:
+            self._p(f"  {cmp_reg} = fcmp ogt {ty} {src}, 0.0")
+            self._p(f"  {reg} = select i1 {cmp_reg}, {ty} {src}, {ty} 0.0")
+        else:
+            self._p(f"  {cmp_reg} = icmp sgt {ty} {src}, 0")
+            self._p(f"  {reg} = select i1 {cmp_reg}, {ty} {src}, {ty} 0")
+        self._ref_types[reg] = ty
+        return reg
+
     def _emit_relu(self, instr: Instruction) -> None:
         ty = self._infer_type(instr)
+        if instr.dest is not None and self._is_pointer_value(instr.dest):
+            self._emit_map(
+                instr, lambda args: self._relu_scalar(ty, args[0])
+            )
+            return
         src = self._operand_for(instr, 0, ty, "cvt")
         dst = self._dest(instr)
         cmp_reg = self._fresh("cmp")
@@ -917,12 +1158,8 @@ class LLVMCodegen:
             self._p(f"  {cmp_reg} = icmp sgt {ty} {src}, 0")
             self._p(f"  {dst} = select i1 {cmp_reg}, {ty} {src}, {ty} 0")
 
-    def _emit_gelu(self, instr: Instruction) -> None:
+    def _gelu_scalar(self, ty: str, x: str) -> str:
         """GELU(x) = 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))."""
-        ty = self._infer_type(instr)
-        x = self._operand_for(instr, 0, ty, "cvt")
-        if instr.dest is None:
-            return
         t1 = self._bin("fmul", ty, x, x, "gelu_t1")
         x3 = self._bin("fmul", ty, t1, x, "gelu_x3")
         in1 = self._bin("fmul", ty, _float_literal(0.044715), x3, "gelu_in1")
@@ -933,38 +1170,94 @@ class LLVMCodegen:
         tanh_reg = self._call_math("tanh", ty, inner, "gelu_tanh")
         p1 = self._bin("fadd", ty, "1.0", tanh_reg, "gelu_p1")
         hx = self._bin("fmul", ty, x, "0.5", "gelu_hx")
-        out = self._bin("fmul", ty, hx, p1, "gelu_out")
-        self._bind_dest(instr, out, ty)
+        return self._bin("fmul", ty, hx, p1, "gelu_out")
 
-    def _emit_sigmoid(self, instr: Instruction) -> None:
+    def _sigmoid_scalar(self, ty: str, x: str) -> str:
         """Sigmoid(x) = 1 / (1 + exp(-x))."""
-        ty = self._infer_type(instr)
-        x = self._operand_for(instr, 0, ty, "cvt")
-        if instr.dest is None:
-            return
         neg = self._fresh("sig_neg")
         self._namer.register_definition(neg)
         self._p(f"  {neg} = fneg {ty} {x}")
         self._ref_types[neg] = ty
         exp_reg = self._call_math("exp", ty, neg, "sig_exp")
         den = self._bin("fadd", ty, "1.0", exp_reg, "sig_den")
-        out = self._bin("fdiv", ty, "1.0", den, "sig_out")
+        return self._bin("fdiv", ty, "1.0", den, "sig_out")
+
+    def _emit_gelu(self, instr: Instruction) -> None:
+        """GELU(x) = 0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))."""
+        ty = self._infer_type(instr)
+        if instr.dest is not None and self._is_pointer_value(instr.dest):
+            self._emit_map(
+                instr, lambda args: self._gelu_scalar(ty, args[0])
+            )
+            return
+        x = self._operand_for(instr, 0, ty, "cvt")
+        if instr.dest is None:
+            return
+        out = self._gelu_scalar(ty, x)
+        self._bind_dest(instr, out, ty)
+
+    def _emit_sigmoid(self, instr: Instruction) -> None:
+        """Sigmoid(x) = 1 / (1 + exp(-x))."""
+        ty = self._infer_type(instr)
+        if instr.dest is not None and self._is_pointer_value(instr.dest):
+            self._emit_map(
+                instr, lambda args: self._sigmoid_scalar(ty, args[0])
+            )
+            return
+        x = self._operand_for(instr, 0, ty, "cvt")
+        if instr.dest is None:
+            return
+        out = self._sigmoid_scalar(ty, x)
         self._bind_dest(instr, out, ty)
 
     def _emit_softmax(self, instr: Instruction) -> None:
         """Numerically stable softmax over the last axis (three passes)."""
         ty = self._infer_type(instr)
+        axis = instr.attrs.get("axis", -1)
+        if axis != -1:
+            raise LLVMCodegenError(
+                f"softmax: only axis=-1 is supported, got axis={axis}"
+            )
         x = self._ptr_of(instr, 0, ty)
         ty = self._ptr_elem_ty(x, ty)
-        n = self._dim_of(
-            instr, ("length", "len", "n"), 1, operand=0, axis=-1
-        )
-        out = self._dest_buffer(instr, n, ty)
+        shape = tuple(instr.operands[0].shape)
+        if shape:
+            n = max(1, int(shape[-1]))
+            rows = 1
+            for dim in shape[:-1]:
+                rows *= max(1, int(dim))
+        else:
+            n = max(1, self._dim_of(
+                instr, ("length", "len", "n"), 1, operand=0, axis=-1
+            ))
+            rows = 1
+        total = rows * n
+        if instr.dest is not None and instr.dest.shape:
+            dest_count = self._shape_count(instr.dest)
+            if dest_count != total:
+                raise LLVMCodegenError(
+                    f"softmax: destination shape needs {dest_count} "
+                    f"element(s) but input provides {total}"
+                )
+            total = dest_count
+        self._require_elements(instr, 0, total, "softmax")
+        out = self._dest_buffer(instr, total, ty)
+        row_ctx = self._loop_open(rows, None, "sm_row") if rows > 1 else None
+        row_off = row_ctx.value if row_ctx is not None else None
+
+        def flat(idx: str, hint: str) -> str:
+            if row_off is None:
+                return idx
+            return self._iadd(
+                self._imul(row_off, n, f"{hint}_r"), idx, hint
+            )
 
         max_ptr = self._alloc_slot(ty, 1, "sm_m")
         self._p(f"  store {ty} {_float_literal(-3.4e38)}, {ty}* {max_ptr}")
         ctx = self._loop_open(n, None, "sm_max_i")
-        xv = self._load(ty, self._gep(ty, x, ctx.value, "sm_xp1"), "sm_xv1")
+        xv = self._load(
+            ty, self._gep(ty, x, flat(ctx.value, "sm_xp1"), "sm_xp1"), "sm_xv1"
+        )
         mv = self._load(ty, max_ptr, "sm_mv1")
         cmp_reg = self._fresh("sm_cmp1")
         self._namer.register_definition(cmp_reg)
@@ -978,7 +1271,9 @@ class LLVMCodegen:
         sum_ptr = self._alloc_slot(ty, 1, "sm_s")
         self._p(f"  store {ty} 0.0, {ty}* {sum_ptr}")
         ctx = self._loop_open(n, None, "sm_sum_i")
-        xv = self._load(ty, self._gep(ty, x, ctx.value, "sm_xp2"), "sm_xv2")
+        xv = self._load(
+            ty, self._gep(ty, x, flat(ctx.value, "sm_xp2"), "sm_xp2"), "sm_xv2"
+        )
         mv = self._load(ty, max_ptr, "sm_mv2")
         diff = self._bin("fsub", ty, xv, mv, "sm_diff2")
         exp_reg = self._call_math("exp", ty, diff, "sm_exp2")
@@ -988,16 +1283,20 @@ class LLVMCodegen:
         self._loop_close(ctx)
 
         ctx = self._loop_open(n, None, "sm_div_i")
-        xv = self._load(ty, self._gep(ty, x, ctx.value, "sm_xp3"), "sm_xv3")
+        xv = self._load(
+            ty, self._gep(ty, x, flat(ctx.value, "sm_xp3"), "sm_xp3"), "sm_xv3"
+        )
         mv = self._load(ty, max_ptr, "sm_mv3")
         diff = self._bin("fsub", ty, xv, mv, "sm_diff3")
         exp_reg = self._call_math("exp", ty, diff, "sm_exp3")
         sv = self._load(ty, sum_ptr, "sm_sv3")
         quotient = self._bin("fdiv", ty, exp_reg, sv, "sm_q3")
-        op = self._gep(ty, out, ctx.value, "sm_op3")
+        op = self._gep(ty, out, flat(ctx.value, "sm_op3"), "sm_op3")
         self._p(f"  store {ty} {quotient}, {ty}* {op}")
         self._loop_close(ctx)
 
+        if row_ctx is not None:
+            self._loop_close(row_ctx)
         self._finalize_from_buffer(instr, out, ty)
 
     def _emit_maxpool(self, instr: Instruction) -> None:
@@ -1013,6 +1312,9 @@ class LLVMCodegen:
         channels = max(1, int(channels))
         height = max(1, int(height))
         width = max(1, int(width))
+        self._require_elements(
+            instr, 0, channels * height * width, "maxpool input"
+        )
         kernel = max(1, self._dim_of(instr, ("kernel", "kernel_shape"), 2))
         stride = max(1, self._dim_of(instr, ("stride", "strides"), 2))
         out_h = max(0, (height - kernel) // stride + 1)
@@ -1076,12 +1378,14 @@ class LLVMCodegen:
     def _emit_dot(self, instr: Instruction) -> None:
         """Dot product: sum(a[i] * b[i])."""
         ty = self._infer_type(instr)
-        a = self._ptr_of(instr, 0, ty)
-        ty = self._ptr_elem_ty(a, ty)
-        b = self._ptr_of(instr, 1, ty)
         length = max(1, self._dim_of(
             instr, ("length", "len", "n"), 1, operand=0, axis=-1
         ))
+        self._require_elements(instr, 0, length, "dot length")
+        self._require_elements(instr, 1, length, "dot length")
+        a = self._ptr_of(instr, 0, ty)
+        ty = self._ptr_elem_ty(a, ty)
+        b = self._ptr_of(instr, 1, ty)
         acc = self._alloc_slot(ty, 1, "dot_acc")
         self._p(f"  store {ty} 0.0, {ty}* {acc}")
         ctx = self._loop_open(length, None, "dot_i")
@@ -1097,13 +1401,15 @@ class LLVMCodegen:
     def _emit_matmul(self, instr: Instruction) -> None:
         """Matrix multiply: C[m,n] = A[m,k] x B[k,n] (row major)."""
         ty = self._infer_type(instr)
-        a = self._ptr_of(instr, 0, ty)
-        ty = self._ptr_elem_ty(a, ty)
-        b = self._ptr_of(instr, 1, ty)
         m = self._dim_of(instr, ("m", "rows"), 1, operand=0, axis=0)
         k = self._dim_of(instr, ("k", "inner"), 1, operand=0, axis=1)
         n = self._dim_of(instr, ("n", "cols"), 1, operand=1, axis=1)
         m, k, n = max(1, m), max(1, k), max(1, n)
+        self._require_elements(instr, 0, m * k, "matmul A")
+        self._require_elements(instr, 1, k * n, "matmul B")
+        a = self._ptr_of(instr, 0, ty)
+        ty = self._ptr_elem_ty(a, ty)
+        b = self._ptr_of(instr, 1, ty)
         c = self._dest_buffer(instr, m * n, ty)
         acc = self._alloc_slot(ty, 1, "mm_acc")
 
@@ -1138,10 +1444,6 @@ class LLVMCodegen:
     def _emit_gemm(self, instr: Instruction) -> None:
         """General matrix multiply: C = A x W (+ bias), optional trans_b."""
         ty = self._infer_type(instr)
-        a = self._ptr_of(instr, 0, ty)
-        ty = self._ptr_elem_ty(a, ty)
-        w = self._ptr_of(instr, 1, ty)
-        bias = self._ptr_of(instr, 2, ty) if len(instr.operands) >= 3 else None
         if instr.attrs.get("trans_a"):
             raise LLVMCodegenError("gemm trans_a is not supported")
 
@@ -1155,6 +1457,14 @@ class LLVMCodegen:
         else:
             n = self._dim_of(instr, ("N", "n", "cols"), 1, operand=1, axis=1)
         m, k, n = max(1, m), max(1, k), max(1, n)
+        self._require_elements(instr, 0, m * k, "gemm A")
+        self._require_elements(instr, 1, k * n, "gemm W")
+        if len(instr.operands) >= 3:
+            self._require_elements(instr, 2, n, "gemm bias")
+        a = self._ptr_of(instr, 0, ty)
+        ty = self._ptr_elem_ty(a, ty)
+        w = self._ptr_of(instr, 1, ty)
+        bias = self._ptr_of(instr, 2, ty) if len(instr.operands) >= 3 else None
         c = self._dest_buffer(instr, m * n, ty)
         acc = self._alloc_slot(ty, 1, "gemm_acc")
 
@@ -1202,16 +1512,12 @@ class LLVMCodegen:
     def _emit_conv(self, instr: Instruction) -> None:
         """2D convolution (NCHW layout) with stride/padding/bias."""
         ty = self._infer_type(instr)
-        x = self._ptr_of(instr, 0, ty)
-        ty = self._ptr_elem_ty(x, ty)
-        w = self._ptr_of(instr, 1, ty)
-        bias = self._ptr_of(instr, 2, ty) if len(instr.operands) >= 3 else None
 
         x_shape = tuple(instr.operands[0].shape)
         if len(x_shape) >= 3:
-            cin, height, width = x_shape[-3], x_shape[-2], x_shape[-1]
+            x_cin, height, width = x_shape[-3], x_shape[-2], x_shape[-1]
         else:
-            cin = height = width = 1
+            x_cin = height = width = 1
         w_shape = tuple(instr.operands[1].shape)
         if len(w_shape) >= 3:
             cout, cin, kernel = w_shape[0], w_shape[1], w_shape[2]
@@ -1220,11 +1526,25 @@ class LLVMCodegen:
             kernel = self._dim_of(
                 instr, ("kernel_size", "kernel_shape"), 3
             )
-        cin = max(1, int(cin))
+        x_cin = max(1, int(x_cin))
         height = max(1, int(height))
         width = max(1, int(width))
         cout = max(1, int(cout))
+        cin = max(1, int(cin))
         kernel = max(1, int(kernel))
+        self._require_elements(
+            instr, 0, x_cin * height * width, "conv input"
+        )
+        self._require_elements(
+            instr, 1, cout * cin * kernel * kernel, "conv weights"
+        )
+        if len(instr.operands) >= 3:
+            self._require_elements(instr, 2, cout, "conv bias")
+        x = self._ptr_of(instr, 0, ty)
+        ty = self._ptr_elem_ty(x, ty)
+        w = self._ptr_of(instr, 1, ty)
+        bias = self._ptr_of(instr, 2, ty) if len(instr.operands) >= 3 else None
+
         stride = max(1, self._dim_of(instr, ("stride", "strides"), 1))
         padding = max(0, self._as_int(
             instr.attrs.get("padding", instr.attrs.get("pads", 0)), 0
