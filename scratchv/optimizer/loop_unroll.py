@@ -42,8 +42,8 @@ from scratchv.ir.types import (
 _SKIP_KEYS = (
     "bad_attrs", "step_not_one", "trip_lt_2", "already_unrolled",
     "body_has_branches", "nested_loop", "body_too_large", "multi_def",
-    "no_factor", "growth_limit", "unprofitable", "unpaired",
-    "internal_error",
+    "carried_value", "no_factor", "growth_limit", "unprofitable",
+    "unpaired", "internal_error",
 )
 
 _BARRIER_OPS = (OpCode.LABEL, OpCode.BR, OpCode.BR_IF)
@@ -92,6 +92,10 @@ class LoopUnroll:
         # FOR instructions already transformed by this run (avoids counting
         # rescan artifacts such as a freshly created epilogue loop).
         self._handled_loops: set[int] = set()
+        # id(FOR) -> (FOR object, skip reasons already counted this run).
+        # Holding the object prevents id reuse from hiding later skips; the
+        # reason set keeps repeated rescans from inflating the counters.
+        self._skip_recorded: dict[int, tuple[Instruction, set[str]]] = {}
         self._last_scan_unpaired = False
         # Rolling "current copy" name map shared by ``_copy_region`` calls.
         self._copy_cur: dict[str, str] = {}
@@ -107,13 +111,15 @@ class LoopUnroll:
     def run(self) -> int:
         """Run unrolling on all functions; return the number of loops unrolled.
 
-        The pass is repeatable: partially unrolled loops carry an
-        ``attrs["unrolled"]`` marker and are skipped on subsequent runs.
+        The pass is repeatable: every loop written by the pass (main
+        partially unrolled loop and remainder loop alike) carries an
+        ``attrs["unrolled"]`` marker and is skipped on subsequent runs.
         """
         self._stats = self._empty_stats()
         self._name_cache = {}
         self._seen_loops = set()
         self._handled_loops = set()
+        self._skip_recorded = {}
         self._stats["instructions_before"] = self._count_instructions()
 
         for func in self.program.functions:
@@ -203,29 +209,29 @@ class LoopUnroll:
         end = attrs.get("end")
         step = attrs.get("step")
         if not (type(start) is int and type(end) is int and type(step) is int):
-            self._skip("bad_attrs")
+            self._skip_loop(for_ins, "bad_attrs")
             return None
         if step != 1:
-            self._skip("step_not_one")
+            self._skip_loop(for_ins, "step_not_one")
             return None
 
         n_trip = end - start
         if n_trip < 2:
-            self._skip("trip_lt_2")
+            self._skip_loop(for_ins, "trip_lt_2")
             return None
         if "unrolled" in attrs:
-            self._skip("already_unrolled")
+            self._skip_loop(for_ins, "already_unrolled")
             return None
 
         region = instrs[for_idx + 1:endfor_idx]
         if any(ins.opcode in _BARRIER_OPS for ins in region):
-            self._skip("body_has_branches")
+            self._skip_loop(for_ins, "body_has_branches")
             return None
         if any(ins.opcode in _LOOP_OPS for ins in region):
-            self._skip("nested_loop")
+            self._skip_loop(for_ins, "nested_loop")
             return None
         if len(region) > self._body_limit:
-            self._skip("body_too_large")
+            self._skip_loop(for_ins, "body_too_large")
             return None
 
         def_counts: dict[str, int] = {}
@@ -236,14 +242,21 @@ class LoopUnroll:
         iv = for_ins.dest
         iv_name = iv.name if iv is not None else ""
         if any(count > 1 for count in def_counts.values()):
-            self._skip("multi_def")
+            self._skip_loop(for_ins, "multi_def")
             return None
         if iv_name and any(
             ins.dest is not None and ins.dest.name == iv_name
             for ins in region
         ):
-            self._skip("multi_def")
+            self._skip_loop(for_ins, "multi_def")
             return None
+
+        # Loop-carried (self/forward-referenced) body values cannot be
+        # expressed by the single renamed epilogue copy: its uses stay bound
+        # to the pre-loop names, so the second remainder iteration reads a
+        # stale value.  Reject that shape instead of emitting wrong IR.
+        has_forward_ref = self._has_forward_reference(
+            region, set(def_counts), iv_name)
 
         body_size = len(region)
         iv_used = bool(iv_name) and any(
@@ -261,12 +274,15 @@ class LoopUnroll:
             elif self._epilogue and limit >= 2:
                 candidates = [("partial_epilogue", limit)]
             else:
-                self._skip("no_factor")
+                self._skip_loop(for_ins, "no_factor")
                 return None
 
         last_reason = "no_factor"
         for mode, factor in candidates:
             q, r = divmod(n_trip, factor)
+            if mode == "partial_epilogue" and r > 1 and has_forward_ref:
+                last_reason = "carried_value"
+                continue
             if mode == "full":
                 m_cost = factor if iv_used else 0
                 s_cost = 0
@@ -297,7 +313,7 @@ class LoopUnroll:
                 dynamic_saving=dynamic_saving,
             )
 
-        self._skip(last_reason)
+        self._skip_loop(for_ins, last_reason)
         return None
 
     # ── IR rewriting ────────────────────────────────────────────────────
@@ -406,7 +422,7 @@ class LoopUnroll:
                 ep_for = Instruction(
                     OpCode.FOR, ep_iv, [],
                     {"start": start + plan.q * plan.U, "end": end,
-                     "step": 1})
+                     "step": 1, "unrolled": 1})
                 self._handled_loops.add(id(ep_for))
                 self._copy_cur = {}
                 self._epilogue_copy = True
@@ -548,6 +564,26 @@ class LoopUnroll:
         dest = Value(name=name, dtype=dtype, is_constant=False)
         return dest, Instruction(opcode, dest, [lhs, rhs])
 
+    @staticmethod
+    def _has_forward_reference(
+        region: list, body_def_names: set[str], iv_name: str,
+    ) -> bool:
+        """Whether the region reads a body-defined value before defining it.
+
+        This covers both forward references (``t = add(u, one)`` before
+        ``u = ...``) and self references (``acc = add(acc, t)``), i.e. the
+        loop-carried values a single epilogue copy cannot express.
+        """
+        defined: set[str] = set()
+        for ins in region:
+            for op in ins.operands:
+                if (op.name != iv_name and op.name in body_def_names
+                        and op.name not in defined):
+                    return True
+            if ins.dest is not None:
+                defined.add(ins.dest.name)
+        return False
+
     def _name_used_after(
         self, func: Function, block, for_idx: int, endfor_idx: int,
         name: str,
@@ -594,18 +630,26 @@ class LoopUnroll:
                 instr.operands[j] = replacement
 
     def _snapshot(self, func: Function) -> list:
+        """Save the instruction list, attrs and operands of every block.
+
+        Operands are captured because ``_redirect_uses`` rewrites them in
+        place; without them an exception mid-rewrite would leave a
+        half-rewritten function behind.
+        """
         return [
             (block, list(block.instructions),
-             [(ins, dict(ins.attrs)) for ins in block.instructions])
+             [(ins, dict(ins.attrs), list(ins.operands))
+              for ins in block.instructions])
             for block in func.blocks
         ]
 
     @staticmethod
     def _restore(func: Function, snapshot: list) -> None:
-        for block, instrs, attrs in snapshot:
+        for block, instrs, saved in snapshot:
             block.instructions = instrs
-            for ins, saved in attrs:
-                ins.attrs = saved
+            for ins, attrs, operands in saved:
+                ins.attrs = attrs
+                ins.operands = operands
 
     def _count_instructions(self) -> int:
         return sum(
@@ -616,6 +660,23 @@ class LoopUnroll:
 
     def _skip(self, reason: str) -> None:
         self._stats["skipped"][reason] += 1
+
+    def _skip_loop(self, for_ins: Instruction, reason: str) -> None:
+        """Record a skip reason for *for_ins* at most once per ``run()``.
+
+        ``_process_function`` rescans the block after every applied loop, so
+        the same untouched loop is examined repeatedly; counting it each
+        time would inflate the user-visible statistics.
+        """
+        key = id(for_ins)
+        entry = self._skip_recorded.get(key)
+        if entry is None or entry[0] is not for_ins:
+            entry = (for_ins, set())
+            self._skip_recorded[key] = entry
+        if reason in entry[1]:
+            return
+        entry[1].add(reason)
+        self._skip(reason)
 
     @staticmethod
     def _empty_stats() -> dict:
