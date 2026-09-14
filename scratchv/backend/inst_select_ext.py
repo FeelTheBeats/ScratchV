@@ -24,7 +24,7 @@ from scratchv.backend.instruction_select import InstructionSelector
 from scratchv.backend.machine_types import (
     MachineOp, MachineOperand,
 )
-from scratchv.ir.types import DataType, Instruction, Program
+from scratchv.ir.types import DataType, Instruction, Program, Value
 
 
 class ExtendedInstructionSelector(InstructionSelector):
@@ -63,10 +63,21 @@ class ExtendedInstructionSelector(InstructionSelector):
         self.use_hardware_sqrt = use_hardware_sqrt
         self._current_dtype: Optional[DataType] = None
         self._temp_counter = 0
+        # Names of values defined by an emitted instruction (e.g. the dest
+        # of ``load_const_f64``).  Such "constants" are addressable vregs
+        # and must not be re-materialized as literals.
+        self._defined_names: set[str] = set()
 
     def run(self) -> list:
         """Select instructions, resetting the temp counter for determinism."""
         self._temp_counter = 0
+        self._defined_names = {
+            instr.dest.name
+            for func in self.program.functions
+            for block in func.blocks
+            for instr in block.instructions
+            if instr.dest is not None
+        }
         return super().run()
 
     # ------------------------------------------------------------------
@@ -93,35 +104,43 @@ class ExtendedInstructionSelector(InstructionSelector):
         If hardware F extension is available, use ``fsqrt.s``.
         Otherwise emit a library call to ``sqrtf`` (float) or ``sqrt``
         (double).
+
+        Float32 literal arguments are materialized by their exact IEEE-754
+        bit pattern (never ``int()``-truncated); float64 literals raise
+        ``ValueError`` (no 64-bit materialization in RV32IM).
         """
         if self._involves_fp64(instr):
             self._require_fp64(instr)
         self._check_dtype(
             instr, (DataType.FLOAT32, DataType.FLOAT64), "sqrt")
-        src = self._op(instr, 0)
         dst = self._dst(instr)
-        dtype = instr.dest.dtype if instr.dest else DataType.FLOAT32
+        dtype = instr.dest.dtype
 
         if self.use_hardware_sqrt:
+            src = self._materialized_op(instr, 0, prefix="sqrt_imm")
             if dtype == DataType.FLOAT64:
                 self._emit(MachineOp.SQRT_D, dst, src,
                            comment="fsqrt.d (hardware)")
             else:
                 self._emit(MachineOp.SQRT_S, dst, src,
                            comment="fsqrt.s (hardware)")
+            return
+
+        # Library call: argument in a0, result in a0
+        if self._literal_operand(instr.operands[0]):
+            bits = self._constant_bits(instr, instr.operands[0])
+            self._emit(MachineOp.LI, MachineOperand.reg("a0"),
+                       MachineOperand.immediate(bits),
+                       comment="sqrt arg -> a0")
         else:
-            # Library call: argument in a0, result in a0
-            if src.kind == "imm":
-                self._emit(MachineOp.LI, MachineOperand.reg("a0"), src,
-                           comment="sqrt arg -> a0")
-            else:
-                self._emit(MachineOp.MV, MachineOperand.reg("a0"), src,
-                           comment="sqrt arg -> a0")
-            func = "sqrt" if dtype == DataType.FLOAT64 else "sqrtf"
-            self._emit(MachineOp.CALL, comment=func)
-            if dst:
-                self._emit(MachineOp.MV, dst, MachineOperand.reg("a0"),
-                           comment="sqrt result")
+            src = self._op(instr, 0)
+            self._emit(MachineOp.MV, MachineOperand.reg("a0"), src,
+                       comment="sqrt arg -> a0")
+        func = "sqrt" if dtype == DataType.FLOAT64 else "sqrtf"
+        self._emit(MachineOp.CALL, comment=func)
+        if dst:
+            self._emit(MachineOp.MV, dst, MachineOperand.reg("a0"),
+                       comment="sqrt result")
 
     # ------------------------------------------------------------------
     # min / max
@@ -130,11 +149,16 @@ class ExtendedInstructionSelector(InstructionSelector):
     def _select_min(self, instr: Instruction) -> None:
         """Select instruction for min(a, b).
 
-        Integer min (branchless):
-            slt tmp, a, b       # tmp = (a < b)
-            sub dst, b, a       # diff = b - a
-            and tmp, tmp, dst   # mask = tmp & diff
-            add dst, a, tmp     # dst = a + mask
+        Integer min (branchless, 0/-1 mask):
+            slt tmp, a, b        # tmp = (a < b)
+            sub mask, x0, tmp    # mask = 0 or -1
+            sub diff, a, b       # diff = a - b
+            and diff, diff, mask # diff = (a < b) ? a - b : 0
+            add dst, b, diff     # dst = (a < b) ? a : b
+
+        Literal operands are materialized first: ``sub``/``and``/``add``
+        have no immediate form, and f64 literals have no materialization
+        at all (fail-loud).
         """
         if self._involves_fp64(instr):
             self._require_fp64(instr)
@@ -142,32 +166,39 @@ class ExtendedInstructionSelector(InstructionSelector):
             instr,
             (DataType.INT32, DataType.INT64, DataType.FLOAT64),
             "min")
-        a = self._op(instr, 0)
-        b = self._op(instr, 1)
+        a = self._materialized_op(instr, 0, prefix="min_const")
+        b = self._materialized_op(instr, 1, prefix="min_const")
         dst = self._dst(instr)
 
-        if instr.dest is not None and instr.dest.dtype == DataType.FLOAT64:
+        if instr.dest.dtype == DataType.FLOAT64:
             # Use FMIN.D pseudo (expands to branchless sequence)
             self._emit(MachineOp.FMIN_D, dst, a, b, comment="fmin.d")
         else:
             tmp = self._fresh_temp("min_slt")
             self._emit(MachineOp.SLT, tmp, a, b, comment="min: slt")
+            mask = self._fresh_temp("min_mask")
+            self._emit(MachineOp.SUB, mask, MachineOperand.reg("x0"), tmp,
+                       comment="min: mask")
             diff = self._fresh_temp("min_sub")
-            self._emit(MachineOp.SUB, diff, b, a, comment="min: sub")
-            and_tmp = self._fresh_temp("min_and")
+            self._emit(MachineOp.SUB, diff, a, b, comment="min: sub")
+            self._emit(MachineOp.AND, diff, diff, mask, comment="min: and")
             self._emit(
-                MachineOp.AND, and_tmp, tmp, diff, comment="min: and"
+                MachineOp.ADD, dst, b, diff, comment="min result"
             )
-            if dst:
-                self._emit(
-                    MachineOp.ADD, dst, a, and_tmp, comment="min result"
-                )
 
     def _select_max(self, instr: Instruction) -> None:
         """Select instruction for max(a, b).
 
-        Uses the existing `max` pseudo-instruction from the base selector,
-        or a branchless sequence if not available.
+        Integer max (branchless, 0/-1 mask, symmetric to min):
+            slt tmp, a, b        # tmp = (a < b)
+            sub mask, x0, tmp    # mask = 0 or -1
+            sub diff, b, a       # diff = b - a
+            and diff, diff, mask # diff = (a < b) ? b - a : 0
+            add dst, a, diff     # dst = (a < b) ? b : a
+
+        The machine-level ``max`` pseudo is not used: its encoder fallback
+        branch is broken (falls back to x0 instead of rs2), so the pseudo
+        computes max incorrectly for a < b.
         """
         if self._involves_fp64(instr):
             self._require_fp64(instr)
@@ -175,15 +206,24 @@ class ExtendedInstructionSelector(InstructionSelector):
             instr,
             (DataType.INT32, DataType.INT64, DataType.FLOAT64),
             "max")
-        a = self._op(instr, 0)
-        b = self._op(instr, 1)
+        a = self._materialized_op(instr, 0, prefix="max_const")
+        b = self._materialized_op(instr, 1, prefix="max_const")
         dst = self._dst(instr)
 
-        if instr.dest is not None and instr.dest.dtype == DataType.FLOAT64:
+        if instr.dest.dtype == DataType.FLOAT64:
             self._emit(MachineOp.FMAX_D, dst, a, b, comment="fmax.d")
         else:
-            # Use existing MAX pseudo (base selector has this)
-            self._emit(MachineOp.MAX, dst, a, b, comment="max")
+            tmp = self._fresh_temp("max_slt")
+            self._emit(MachineOp.SLT, tmp, a, b, comment="max: slt")
+            mask = self._fresh_temp("max_mask")
+            self._emit(MachineOp.SUB, mask, MachineOperand.reg("x0"), tmp,
+                       comment="max: mask")
+            diff = self._fresh_temp("max_sub")
+            self._emit(MachineOp.SUB, diff, b, a, comment="max: sub")
+            self._emit(MachineOp.AND, diff, diff, mask, comment="max: and")
+            self._emit(
+                MachineOp.ADD, dst, a, diff, comment="max result"
+            )
 
     # ------------------------------------------------------------------
     # abs
@@ -203,10 +243,10 @@ class ExtendedInstructionSelector(InstructionSelector):
             instr,
             (DataType.INT32, DataType.INT64, DataType.FLOAT64),
             "abs")
-        src = self._op(instr, 0)
+        src = self._materialized_op(instr, 0, prefix="abs_const")
         dst = self._dst(instr)
 
-        if instr.dest is not None and instr.dest.dtype == DataType.FLOAT64:
+        if instr.dest.dtype == DataType.FLOAT64:
             # fabs.d: clear the sign bit
             self._emit(MachineOp.FABS_D, dst, src, comment="fabs.d")
         else:
@@ -231,16 +271,16 @@ class ExtendedInstructionSelector(InstructionSelector):
     def _select_idiv(self, instr: Instruction) -> None:
         """Select instruction for integer division."""
         self._check_dtype(instr, (DataType.INT32,), "idiv")
-        a = self._op(instr, 0)
-        b = self._op(instr, 1)
+        a = self._materialized_op(instr, 0, prefix="idiv_const")
+        b = self._materialized_op(instr, 1, prefix="idiv_const")
         dst = self._dst(instr)
         self._emit(MachineOp.DIV, dst, a, b, comment="div")
 
     def _select_rem(self, instr: Instruction) -> None:
         """Select instruction for integer remainder."""
         self._check_dtype(instr, (DataType.INT32,), "rem")
-        a = self._op(instr, 0)
-        b = self._op(instr, 1)
+        a = self._materialized_op(instr, 0, prefix="rem_const")
+        b = self._materialized_op(instr, 1, prefix="rem_const")
         dst = self._dst(instr)
         self._emit(MachineOp.REM, dst, a, b, comment="rem")
 
@@ -255,6 +295,9 @@ class ExtendedInstructionSelector(InstructionSelector):
 
     def _select_load_f64(self, instr: Instruction) -> None:
         """Load a 64-bit float from memory."""
+        self._check_signature(
+            instr, (DataType.FLOAT64,),
+            (DataType.INT32, DataType.INT64), "load_f64")
         src = self._op(instr, 0)
         dst = self._dst(instr)
         self._emit(MachineOp.FLD, dst, src, comment="fld (load f64)")
@@ -265,71 +308,90 @@ class ExtendedInstructionSelector(InstructionSelector):
             raise ValueError(
                 "store_f64 requires operands [addr, value], got "
                 f"{len(instr.operands)} operand(s)")
+        addr = instr.operands[0]
+        if addr.dtype not in (DataType.INT32, DataType.INT64):
+            raise ValueError(
+                "store_f64 requires an INT32/INT64 address operand, got "
+                f"{addr.dtype.value}")
         val = instr.operands[1]
         if val.dtype != DataType.FLOAT64:
             raise ValueError(
                 "store_f64 requires a FLOAT64 value operand, got "
                 f"{val.dtype.value}")
-        addr = self._op(instr, 0)
-        val_op = self._op(instr, 1)
-        self._emit(MachineOp.FSD, val_op, addr, comment="fsd (store f64)")
+        addr_op = self._op(instr, 0)
+        val_op = self._materialized_op(instr, 1, prefix="store_f64_val")
+        self._emit(MachineOp.FSD, val_op, addr_op, comment="fsd (store f64)")
 
     def _select_fadd_d(self, instr: Instruction) -> None:
         """Add two float64 values."""
-        a = self._op(instr, 0)
-        b = self._op(instr, 1)
+        self._check_dtype(instr, (DataType.FLOAT64,), "fadd_d")
+        a = self._materialized_op(instr, 0, prefix="fadd_d_const")
+        b = self._materialized_op(instr, 1, prefix="fadd_d_const")
         dst = self._dst(instr)
         self._emit(MachineOp.FADD_D, dst, a, b, comment="fadd.d")
 
     def _select_fsub_d(self, instr: Instruction) -> None:
         """Subtract two float64 values."""
-        a = self._op(instr, 0)
-        b = self._op(instr, 1)
+        self._check_dtype(instr, (DataType.FLOAT64,), "fsub_d")
+        a = self._materialized_op(instr, 0, prefix="fsub_d_const")
+        b = self._materialized_op(instr, 1, prefix="fsub_d_const")
         dst = self._dst(instr)
         self._emit(MachineOp.FSUB_D, dst, a, b, comment="fsub.d")
 
     def _select_fmul_d(self, instr: Instruction) -> None:
         """Multiply two float64 values."""
-        a = self._op(instr, 0)
-        b = self._op(instr, 1)
+        self._check_dtype(instr, (DataType.FLOAT64,), "fmul_d")
+        a = self._materialized_op(instr, 0, prefix="fmul_d_const")
+        b = self._materialized_op(instr, 1, prefix="fmul_d_const")
         dst = self._dst(instr)
         self._emit(MachineOp.FMUL_D, dst, a, b, comment="fmul.d")
 
     def _select_fdiv_d(self, instr: Instruction) -> None:
         """Divide two float64 values."""
-        a = self._op(instr, 0)
-        b = self._op(instr, 1)
+        self._check_dtype(instr, (DataType.FLOAT64,), "fdiv_d")
+        a = self._materialized_op(instr, 0, prefix="fdiv_d_const")
+        b = self._materialized_op(instr, 1, prefix="fdiv_d_const")
         dst = self._dst(instr)
         self._emit(MachineOp.FDIV_D, dst, a, b, comment="fdiv.d")
 
     def _select_fcmp_l_d(self, instr: Instruction) -> None:
         """Float64 less-than comparison."""
-        a = self._op(instr, 0)
-        b = self._op(instr, 1)
+        self._check_signature(
+            instr, (DataType.INT32,), (DataType.FLOAT64,), "fcmp_l_d")
+        a = self._materialized_op(instr, 0, prefix="fcmp_l_d_const")
+        b = self._materialized_op(instr, 1, prefix="fcmp_l_d_const")
         dst = self._dst(instr)
         self._emit(MachineOp.FLT_D, dst, a, b, comment="flt.d")
 
     def _select_fcmp_eq_d(self, instr: Instruction) -> None:
         """Float64 equality comparison."""
-        a = self._op(instr, 0)
-        b = self._op(instr, 1)
+        self._check_signature(
+            instr, (DataType.INT32,), (DataType.FLOAT64,), "fcmp_eq_d")
+        a = self._materialized_op(instr, 0, prefix="fcmp_eq_d_const")
+        b = self._materialized_op(instr, 1, prefix="fcmp_eq_d_const")
         dst = self._dst(instr)
         self._emit(MachineOp.FEQ_D, dst, a, b, comment="feq.d")
 
     def _select_fcvt_s_d(self, instr: Instruction) -> None:
         """Convert float64 to float32."""
-        src = self._op(instr, 0)
+        self._check_signature(
+            instr, (DataType.FLOAT32,), (DataType.FLOAT64,), "fcvt_s_d")
+        src = self._materialized_op(instr, 0, prefix="fcvt_s_d_const")
         dst = self._dst(instr)
         self._emit(MachineOp.FCVT_S_D, dst, src, comment="fcvt.s.d")
 
     def _select_fcvt_d_s(self, instr: Instruction) -> None:
         """Convert float32 to float64."""
-        src = self._op(instr, 0)
+        self._check_signature(
+            instr, (DataType.FLOAT64,), (DataType.FLOAT32,), "fcvt_d_s")
+        src = self._materialized_op(instr, 0, prefix="fcvt_d_s_const")
         dst = self._dst(instr)
         self._emit(MachineOp.FCVT_D_S, dst, src, comment="fcvt.d.s")
 
     def _select_load_const_f64(self, instr: Instruction) -> None:
         """Load a float64 constant (exact IEEE-754 bit pattern)."""
+        self._check_signature(
+            instr, (DataType.FLOAT64,), (), "load_const_f64")
         raw_val = instr.attrs.get("value")
         if not isinstance(raw_val, (int, float)):
             raise ValueError(
@@ -400,7 +462,8 @@ class ExtendedInstructionSelector(InstructionSelector):
         """Negate: for float64 use fneg.d, for int use sub x0 - x."""
         if self._involves_fp64(instr):
             self._require_fp64(instr)
-            src = self._op(instr, 0)
+            self._check_dtype(instr, (DataType.FLOAT64,), "neg")
+            src = self._materialized_op(instr, 0, prefix="neg_const")
             dst = self._dst(instr)
             self._emit(MachineOp.FNEG_D, dst, src, comment="fneg.d")
         else:
@@ -431,22 +494,76 @@ class ExtendedInstructionSelector(InstructionSelector):
                 f"instruction '{instr.opcode.value}' involves FLOAT64 but "
                 f"enable_fp64=False (ExtendedInstructionSelector)")
 
-    def _check_dtype(self, instr: Instruction,
-                     allowed: tuple[DataType, ...],
-                     opname: str) -> None:
-        """Guard dest/operand dtypes against the allowed set."""
+    def _materialized_op(self, instr: Instruction, idx: int,
+                         prefix: str = "const") -> MachineOperand:
+        """Return operand *idx* as a register, materializing literals.
+
+        The base ``_op`` routes every constant through ``int()``; for float
+        literals that silently changes the value.  Literal operands are
+        instead materialized with an exact ``LI`` (f32 bit pattern) into a
+        fresh temp; f64 literals fail loud (RV32IM has no 64-bit constant
+        materialization).
+        """
+        op = instr.operands[idx]
+        if not self._literal_operand(op):
+            return MachineOperand.vreg(op.name)
+        bits = self._constant_bits(instr, op)
+        tmp = self._fresh_temp(prefix)
+        self._emit(MachineOp.LI, tmp, MachineOperand.immediate(bits),
+                   comment=f"const {op.const_value!r}")
+        return tmp
+
+    def _literal_operand(self, op: Value) -> bool:
+        """True if *op* is a literal constant (no defining instruction)."""
+        if not (op.is_constant and op.const_value is not None):
+            return False
+        return op.name not in self._defined_names
+
+    def _constant_bits(self, instr: Instruction, op: Value) -> int:
+        """Exact 32-bit materialization of a literal constant operand."""
+        if op.dtype == DataType.FLOAT64:
+            raise ValueError(
+                f"{instr.opcode.value} cannot materialize a FLOAT64 literal "
+                f"({op.const_value!r}): RV32IM has no 64-bit constant "
+                f"materialization; use load_const_f64")
+        if op.dtype == DataType.FLOAT32:
+            return self._fp32_bits(op.const_value)
+        return int(op.const_value)
+
+    @staticmethod
+    def _fp32_bits(value) -> int:
+        """IEEE-754 f32 bit pattern as a signed RV32 immediate."""
+        return struct.unpack("<i", struct.pack("<f", float(value)))[0]
+
+    def _check_signature(self, instr: Instruction,
+                         dest_allowed: tuple[DataType, ...],
+                         operand_allowed: tuple[DataType, ...],
+                         opname: str) -> None:
+        """Validate dest existence and exact dtype sets for an opcode."""
         if instr.dest is None:
             raise ValueError(f"{opname} requires a destination value")
-        allowed_vals = ", ".join(d.value for d in allowed)
-        if instr.dest.dtype not in allowed:
+        if instr.dest.dtype not in dest_allowed:
+            allowed_vals = ", ".join(d.value for d in dest_allowed)
             raise ValueError(
                 f"{opname} requires destination dtype in "
                 f"({allowed_vals}), got {instr.dest.dtype.value}")
         for op in instr.operands:
-            if op.dtype not in allowed:
+            if op.dtype not in operand_allowed:
+                allowed_vals = ", ".join(d.value for d in operand_allowed)
                 raise ValueError(
                     f"{opname} requires operand dtype in "
                     f"({allowed_vals}), got {op.dtype.value}")
+
+    def _check_dtype(self, instr: Instruction,
+                     allowed: tuple[DataType, ...],
+                     opname: str) -> None:
+        """Guard dest/operand dtypes; all operands must match the dest type."""
+        self._check_signature(instr, allowed, allowed, opname)
+        for op in instr.operands:
+            if op.dtype != instr.dest.dtype:
+                raise ValueError(
+                    f"{opname} requires operands to match destination dtype "
+                    f"{instr.dest.dtype.value}, got {op.dtype.value}")
 
     def _is_fp64(self, instr: Instruction) -> bool:
         """Legacy compatibility: float64 involvement with fp64 enabled."""
