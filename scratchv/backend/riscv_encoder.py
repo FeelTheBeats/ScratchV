@@ -19,19 +19,24 @@ class UnsupportedInstructionError(ValueError):
     """Raised when assembly cannot be encoded by the RV32IM encoder."""
 
 
-# Exact F/D mnemonics plus prefixes covering the F/D instruction families.
+# Exact F/D mnemonics plus prefixes/patterns covering the F/D families.
 _FD_EXACT: frozenset[str] = frozenset({"fld", "fsd", "flw", "fsw", "li.d"})
 _FD_PREFIXES: tuple[str, ...] = (
-    "fadd.", "fsub.", "fmul.", "fdiv.", "fsqrt.", "fmin.", "fmax.",
-    "fabs.", "fneg.", "flt.", "fle.", "feq.", "fcvt.", "fmv.",
-    "fsgnj", "fsgnjn", "fsgnjx",
+    "fcvt.",  # e.g. fcvt.s.d / fcvt.d.s (multi-suffix)
+    "fmv.",   # e.g. fmv.x.w / fmv.w.x
+    "fmadd.", "fnmadd.", "fmsub.", "fnmsub.",
+    "fclass.", "fli.", "fround.",
 )
+# Single-suffix families: fadd.d, fsqrt.s, fsgnjx.d, fmin.s, ...
+_FD_PATTERN = re.compile(r"^f[a-z0-9]+\.[sd]$")
 
 
 def _is_fd_mnemonic(op: str) -> bool:
     """Return True if *op* is an F/D-extension instruction mnemonic."""
     op = op.lower()
     if op in _FD_EXACT:
+        return True
+    if _FD_PATTERN.match(op):
         return True
     return any(op.startswith(prefix) for prefix in _FD_PREFIXES)
 
