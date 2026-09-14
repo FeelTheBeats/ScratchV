@@ -64,9 +64,9 @@ class SpikeConfigError(ValueError):
 
 | 参数 | 类型/默认 | 说明 |
 |------|----------|------|
-| `--spike-bin PATH` | str / 无 | spike 可执行文件；无效 → 退出码 2 |
-| `--spike-dasm PATH` | str / 无 | spike-dasm；无效 → 退出码 2 |
-| `--spike-log-parser PATH` | str / 无 | spike-log-parser；无效 → 退出码 2 |
+| `--spike-bin PATH` | str / 无 | spike 可执行文件（必需工具）；无效 → 退出码 2 |
+| `--spike-dasm PATH` | str / 无 | spike-dasm（可选工具）；无效 → WARNING + 继续解析，不阻断 |
+| `--spike-log-parser PATH` | str / 无 | spike-log-parser（可选工具）；无效 → WARNING + 继续解析，不阻断 |
 | `--require-spike` | store_true / 关 | spike 缺失时硬失败（退出码 2） |
 | `--probe-spike` | store_true / 关 | **仅 `run_spike_bench.py`**：探测并打印工具可用性 |
 
@@ -92,7 +92,7 @@ parse_warnings: list[str] = field(default_factory=list)
 
 `build_json_report()` 新增键：`status`、`skip_reason`、`spike_binary`、`parse_warnings`、`tool_warnings`、`spike_tools`（`tools` 为空时不输出该键）。既有键：`binary`、`code_size`、`static_insns`、`max_instr`、`committed_insns`、`wall_time_s`、`exit_code`、`icache`、`dcache`、`top_pcs`、`stderr_tail` 全部保留。
 
-`exit_code` 哨兵兼容：`-1` 超时、`-2` 工具不可用/启动失败；`status` 为权威判读字段。
+`exit_code` 哨兵兼容：`-1` 超时、`-2` 工具不可用/启动失败；skip 路径的 JSON 报告同样填 `-2`；`status` 为权威判读字段。此外，spike 退出 0 但输出中完全没有任何可解析统计段时，防呆为 `status=failed`、`exit_code=-2`（疑似非 Spike 可执行文件）。
 
 ---
 
@@ -188,19 +188,27 @@ class SpikeTools:
                 "warnings": list(self.warnings)}
 
 
-def _resolve_one(tool, cli_flag, cli_value, env_name, legacy_dir, legacy_const,
-                 env, which, common_dirs):
-    """返回 (path|None, source, candidates, warnings)。"""
+def _resolve_one(tool, cli_flag, cli_value, env_name, legacy_const,
+                 env, which, common_dirs, cli_required=True):
+    """返回 (path|None, source, candidates, warnings)。
+
+    cli_required=True（spike）时 CLI 无效抛错；可选工具（dasm/log-parser）
+    传 False，CLI 无效仅告警并继续后续层级。
+    """
     candidates: list[str] = []
     warnings: list[str] = []
 
-    if cli_value:                                          # 1. CLI（显式，硬失败）
+    if cli_value:                                          # 1. CLI（显式）
         cand = os.path.expanduser(cli_value.strip())
         candidates.append(cand)
         if not is_executable(cand):
-            raise SpikeConfigError(
-                f"{cli_flag}={cli_value!r} is not an executable file")
-        return cand, "cli", candidates, warnings
+            if cli_required:
+                raise SpikeConfigError(
+                    f"{cli_flag}={cli_value!r} is not an executable file")
+            warnings.append(
+                f"{cli_flag}={cli_value!r} is not executable; ignored")
+        else:
+            return cand, "cli", candidates, warnings
 
     env_value = (env.get(env_name) or "").strip()          # 2. env（显式，告警继续）
     if env_value:
@@ -242,16 +250,17 @@ def resolve_spike_tools(cli_spike=None, cli_dasm=None, cli_log_parser=None,
     common_dirs = COMMON_SPIKE_DIRS if common_dirs is None else common_dirs
 
     spec = (
-        ("spike", "--spike-bin", cli_spike, ENV_SPIKE_BIN, SPIKE),
-        ("spike-dasm", "--spike-dasm", cli_dasm, ENV_SPIKE_DASM, SPIKE_DASM),
+        ("spike", "--spike-bin", cli_spike, ENV_SPIKE_BIN, SPIKE, True),
+        ("spike-dasm", "--spike-dasm", cli_dasm, ENV_SPIKE_DASM, SPIKE_DASM,
+         False),
         ("spike-log-parser", "--spike-log-parser", cli_log_parser,
-         ENV_SPIKE_LOG_PARSER, SPIKE_LOG_PARSER),
+         ENV_SPIKE_LOG_PARSER, SPIKE_LOG_PARSER, False),
     )
     paths, sources, candidates, warnings = {}, {}, {}, []
-    for tool, flag, cli_value, env_name, legacy_const in spec:
+    for tool, flag, cli_value, env_name, legacy_const, cli_required in spec:
         path, source, cands, warns = _resolve_one(
-            tool, flag, cli_value, env_name, None, legacy_const,
-            env, which, common_dirs)
+            tool, flag, cli_value, env_name, legacy_const,
+            env, which, common_dirs, cli_required=cli_required)
         paths[tool], sources[tool], candidates[tool] = path, source, cands
         warnings.extend(warns)
     return SpikeTools(
@@ -297,13 +306,13 @@ def parse_pc_histogram(stdout: str) -> dict[int, int]: ...
    ```
 
 3. `cmd` 首元素由 `SPIKE` 改为 `tools.spike`；`result.spike_path = tools.spike`；`result.tool_warnings` 合并 `tools.warnings`。
-4. `except FileNotFoundError`：`status="failed"`，消息带 `tools.spike`。
+4. `except FileNotFoundError` / `except OSError`：均 `status="failed"`、`exit_code=-2`，消息带 `tools.spike`（`OSError` 覆盖「文件存在且可执行但内核拒绝 exec」的 ENOEXEC 等场景）。
 5. `except subprocess.TimeoutExpired`：`status="timeout"`。
-6. 正常返回前用 2.6 的解析函数填充字段；`result.exit_code` 保留 `proc.returncode`。
+6. 正常返回前用 2.6 的解析函数填充字段；`result.exit_code` 保留 `proc.returncode`（唯一例外：退出 0 但完全无可解析统计段时置 `-2`，见设计文档 §2.3 第 8b 行）。
 
 ### 2.8 `run_spike_with_log()`（L432-488）
 
-签名加 `*, tools=None`；开头做与 2.7 相同的缺失判断，返回 `(skipped_result, "")`；`cmd` 首元素改 `tools.spike`。
+签名加 `*, tools=None`；开头做与 2.7 相同的缺失判断，返回 `(skipped_result, "")`；`cmd` 首元素改 `tools.spike`；异常映射与 2.7 相同（含 `OSError` → `failed`/`-2`）。
 
 ### 2.9 `generate_spike_report()`（L495-585）
 

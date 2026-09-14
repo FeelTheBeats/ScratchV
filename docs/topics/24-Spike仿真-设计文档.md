@@ -79,7 +79,7 @@ accept(candidate)  ::= os.path.isfile(candidate) AND os.access(candidate, os.X_O
 
 | 层级 | 来源 | 显式程度 | 候选无效时的行为 |
 |------|------|---------|-----------------|
-| 1 | CLI 参数 | 显式（单次运行意图） | **硬失败**：抛配置错误，退出码 2 |
+| 1 | CLI 参数 | 显式（单次运行意图） | `spike`：**硬失败**（抛配置错误，退出码 2）；`spike-dasm` / `spike-log-parser`：**告警**后继续下一层 |
 | 2 | 专用环境变量 | 显式（可能跨项目残留） | **告警**：记入 `tool_warnings`，继续下一层 |
 | 3 | `SCRATCHV_SPIKE_HOME/bin/<tool>` | 隐式（目录提示） | 静默继续（仅在候选列表中留痕） |
 | 4 | `PATH` 自动探测 | 隐式 | 静默继续 |
@@ -112,14 +112,16 @@ accept(candidate)  ::= os.path.isfile(candidate) AND os.access(candidate, os.X_O
 
 | # | 场景 | 默认行为 | `--require-spike` | 退出码 | 报告状态 |
 |---|------|---------|-------------------|--------|---------|
-| 1 | spike 缺失 | `SKIP:` + 搜索位置 + 修复提示 | `ERROR:` + 搜索位置 | 0 / 2 | `skipped` / `error` |
-| 2 | spike-dasm 缺失 | `WARNING:`，其相关功能降级 | 同默认（不升级为失败） | 0 | `tool_warnings` |
-| 3 | spike-log-parser 缺失 | `WARNING:`，其相关功能降级 | 同默认 | 0 | `tool_warnings` |
-| 4 | CLI 显式路径无效（不存在/不可执行/是目录） | `ERROR:` | `ERROR:` | 2 | `error` |
+| 1 | spike 缺失 | `SKIP:` + 搜索位置 + 修复提示；`--json` 时输出 `status=skipped`、`exit_code=-2` 的 JSON | `ERROR:` + 搜索位置 | 0 / 2 | `skipped` / 无报告（仅 stderr） |
+| 2 | spike-dasm 缺失 | `WARNING:`（本模块尚未使用该工具） | 同默认（不升级为失败） | 0 | `tool_warnings` |
+| 3 | spike-log-parser 缺失 | `WARNING:`（本模块尚未使用该工具） | 同默认 | 0 | `tool_warnings` |
+| 4 | `--spike-bin` 无效（不存在/不可执行/是目录） | `ERROR:` | `ERROR:` | 2 | 无报告（仅 stderr） |
+| 4b | `--spike-dasm` / `--spike-log-parser` 无效（可选工具） | `WARNING:` + 继续解析 | 同默认 | 0 或后续结果 | `tool_warnings` |
 | 5 | env 显式路径无效 | `WARNING:` + 继续解析 | 同默认 | 0 或后续结果 | `tool_warnings` |
 | 6 | Spike 超时（`subprocess.TimeoutExpired`） | `ERROR:` | 同默认 | 1 | `timeout` |
-| 7 | Spike 非零退出 / 启动失败 | `ERROR:` | 同默认 | 1 | `failed` |
-| 8 | 输出缺少 cache/commit 段 | 继续，零值 + 告警 | 同默认 | 0 | `parse_warnings` |
+| 7 | Spike 非零退出 / 启动失败（含 `OSError`，如无法 exec 的文件） | `ERROR:` | 同默认 | 1 | `failed` |
+| 8 | 输出缺少**部分** cache/commit 段 | 继续，零值 + 告警 | 同默认 | 0 | `parse_warnings` |
+| 8b | spike 退出 0 但**完全无可解析统计段**（疑似非 Spike 可执行文件） | `status=failed`、`exit_code=-2` + 告警 | 同默认 | 1 | `failed` + `parse_warnings` |
 | 9 | import / `--help` | 永不探测外部工具 | 同默认 | 0 | — |
 
 **退出码契约（模块常量）**：
@@ -359,6 +361,7 @@ $ echo $?
   "status": "skipped",
   "skip_reason": "spike binary not found",
   "spike_binary": null,
+  "exit_code": -2,
   "spike_tools": {
     "spike": {"path": null, "source": "missing"},
     "spike_dasm": {"path": null, "source": "missing"},

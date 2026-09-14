@@ -145,19 +145,29 @@ def _resolve_one(
     env,
     which,
     common_dirs,
+    cli_required: bool = True,
 ) -> tuple[str | None, str, list[str], list[str]]:
-    """Resolve one tool, returning (path, source, candidates, warnings)."""
+    """Resolve one tool, returning (path, source, candidates, warnings).
+
+    An invalid CLI value raises SpikeConfigError when ``cli_required`` is
+    true (the spike binary); for optional tools it degrades to a warning
+    and resolution continues with the lower-priority layers.
+    """
     candidates: list[str] = []
     warnings: list[str] = []
 
-    # 1. CLI (explicit per-run intent: hard failure on invalid value)
+    # 1. CLI (explicit per-run intent)
     if cli_value:
         cand = os.path.expanduser(cli_value.strip())
         candidates.append(cand)
         if not is_executable(cand):
-            raise SpikeConfigError(
-                f"{cli_flag}={cli_value!r} is not an executable file")
-        return cand, "cli", candidates, warnings
+            if cli_required:
+                raise SpikeConfigError(
+                    f"{cli_flag}={cli_value!r} is not an executable file")
+            warnings.append(
+                f"{cli_flag}={cli_value!r} is not executable; ignored")
+        else:
+            return cand, "cli", candidates, warnings
 
     # 2. Dedicated environment variable (explicit, possibly stale: warn)
     env_value = (env.get(env_name) or "").strip()
@@ -209,7 +219,9 @@ def resolve_spike_tools(
 
     Priority: CLI > dedicated env vars > $SCRATCHV_SPIKE_HOME/bin > PATH >
     common install dirs > legacy constants. Invalid CLI paths raise
-    SpikeConfigError; invalid env paths add a warning and fall through.
+    SpikeConfigError for the required spike binary; for the optional tools
+    (spike-dasm / spike-log-parser) they add a warning and fall through.
+    Invalid env paths add a warning and fall through.
     """
     env = os.environ if env is None else env
     which = shutil.which if which is None else which
@@ -218,19 +230,20 @@ def resolve_spike_tools(
     # Legacy constants are read here (not captured at import time) so tests
     # can monkeypatch them and so each call sees the current values.
     spec = (
-        ("spike", "--spike-bin", cli_spike, ENV_SPIKE_BIN, SPIKE),
-        ("spike-dasm", "--spike-dasm", cli_dasm, ENV_SPIKE_DASM, SPIKE_DASM),
+        ("spike", "--spike-bin", cli_spike, ENV_SPIKE_BIN, SPIKE, True),
+        ("spike-dasm", "--spike-dasm", cli_dasm, ENV_SPIKE_DASM, SPIKE_DASM,
+         False),
         ("spike-log-parser", "--spike-log-parser", cli_log_parser,
-         ENV_SPIKE_LOG_PARSER, SPIKE_LOG_PARSER),
+         ENV_SPIKE_LOG_PARSER, SPIKE_LOG_PARSER, False),
     )
     paths: dict[str, str | None] = {}
     sources: dict[str, str] = {}
     candidates: dict[str, tuple[str, ...]] = {}
     warnings: list[str] = []
-    for tool, flag, cli_value, env_name, legacy_const in spec:
+    for tool, flag, cli_value, env_name, legacy_const, cli_required in spec:
         path, source, cands, warns = _resolve_one(
             tool, flag, cli_value, env_name, legacy_const,
-            env, which, common_dirs)
+            env, which, common_dirs, cli_required=cli_required)
         paths[tool], sources[tool], candidates[tool] = path, source, tuple(cands)
         warnings.extend(warns)
 
@@ -245,13 +258,20 @@ def resolve_spike_tools(
 
 
 def _optional_tool_warnings(tools: SpikeTools) -> list[str]:
-    """Warnings for missing optional tools (never escalated to failure)."""
+    """Warnings for missing optional tools (never escalated to failure).
+
+    Neither tool is called by this module yet, so their absence does not
+    degrade any current feature; the messages must not imply otherwise.
+    """
     warnings: list[str] = []
     if tools.spike_dasm is None:
-        warnings.append("spike-dasm not found; disassembly features unavailable")
+        warnings.append(
+            "spike-dasm not found; not used by this module yet "
+            "(disassembly support is not implemented)")
     if tools.spike_log_parser is None:
         warnings.append(
-            "spike-log-parser not found; commit log parsing unavailable")
+            "spike-log-parser not found; not used by this module yet "
+            "(commit log parsing is not implemented)")
     return warnings
 
 
@@ -687,6 +707,14 @@ def run_spike(
         result.stderr = f"ERROR: Spike not found at {tools.spike}"
         result.exit_code = -2
         return result
+    except OSError as e:
+        # Exists and is executable, but the kernel refused to exec it
+        # (ENOEXEC: no shebang, wrong architecture, truncated binary, ...).
+        result.status = "failed"
+        result.stderr = (
+            f"ERROR: failed to start Spike at {tools.spike}: {e}")
+        result.exit_code = -2
+        return result
 
     result.wall_time_s = time.perf_counter() - t_start
     result.total_insns = max_instr  # We set the limit
@@ -706,12 +734,26 @@ def run_spike(
     result.pc_histogram = parse_pc_histogram(result.stdout)
 
     stderr_text = result.stderr or ""
-    if not _RE_COMMIT.search(stderr_text):
+    has_commit_stats = bool(_RE_COMMIT.search(stderr_text))
+    has_icache_stats = bool(_RE_ICACHE_HEADER.search(stderr_text))
+    has_dcache_stats = bool(_RE_DCACHE_HEADER.search(stderr_text))
+    if not has_commit_stats:
         result.parse_warnings.append("commit stats not found in Spike stderr")
-    if not _RE_ICACHE_HEADER.search(stderr_text):
+    if not has_icache_stats:
         result.parse_warnings.append("I$ cache stats not found in Spike stderr")
-    if not _RE_DCACHE_HEADER.search(stderr_text):
+    if not has_dcache_stats:
         result.parse_warnings.append("D$ cache stats not found in Spike stderr")
+
+    # Anti-fake-success guard: a clean exit with no recognizable Spike
+    # statistics at all means the executable produced no usable Spike output
+    # (e.g. /bin/true). Without this, any executable would look "successful".
+    if (proc.returncode == 0
+            and not (has_commit_stats or has_icache_stats or has_dcache_stats)):
+        result.status = "failed"
+        result.exit_code = -2
+        result.parse_warnings.append(
+            "no Spike statistics section found; "
+            "the executable may not be Spike")
 
     return result
 
@@ -790,6 +832,12 @@ def run_spike_with_log(
     except FileNotFoundError:
         result.status = "failed"
         result.stderr = f"ERROR: Spike not found at {tools.spike}"
+        result.exit_code = -2
+        return result, ""
+    except OSError as e:
+        result.status = "failed"
+        result.stderr = (
+            f"ERROR: failed to start Spike at {tools.spike}: {e}")
         result.exit_code = -2
         return result, ""
 
@@ -1070,6 +1118,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return EXIT_CONFIG
 
+    for warning in tools.warnings:
+        print(f"WARNING: {warning}", file=sys.stderr)
+
     if tools.spike is None:
         searched = ", ".join([
             "--spike-bin",
@@ -1096,6 +1147,7 @@ def main(argv: list[str] | None = None) -> int:
             skipped_result = SpikeResult(
                 status="skipped",
                 skip_reason="spike binary not found",
+                exit_code=-2,  # same sentinel as the library skip path
                 tool_warnings=list(tools.warnings),
             )
             print(json.dumps(
