@@ -44,6 +44,21 @@ REASON_NO_ELEMENT_PATTERN = "no-memory-element-pattern"
 REASON_NON_ELEMENTWISE_IV = "non-elementwise-iv-use"
 REASON_ALIASING_STORE = "aliasing-store"
 REASON_UNSUPPORTED_OP = "unsupported-op"
+REASON_REGION_VALUE_ESCAPES = "region-value-escapes"
+
+
+def validate_vector_width(width: object) -> int:
+    """Validate a phase-1 strip width (``>= 2``) and return it.
+
+    The CLI already restricts ``--vector-width`` to ``{2, 4}``, but the
+    programmatic ``CompilerConfig`` API does not, and an unchecked width
+    of ``0`` previously crashed with ``ZeroDivisionError`` inside the
+    vectorizer (review F6).
+    """
+    if isinstance(width, bool) or not isinstance(width, int) or width < 2:
+        raise ValueError(
+            f"vector width must be an integer >= 2 (got {width!r})")
+    return width
 
 
 # ── Element op → vector op mapping ───────────────────────────────────────
@@ -147,7 +162,7 @@ class Vectorizer(CompilerPass):
     def __init__(self, program: Program, *, width: int = 4,
                  elem_bytes: int = 4) -> None:
         self.program = program
-        self.width = width
+        self.width = validate_vector_width(width)
         self.elem_bytes = elem_bytes
         self._report: list[LoopVectorizationRecord] = []
         self._counter = 0
@@ -194,7 +209,7 @@ class Vectorizer(CompilerPass):
                     self._report.append(rec)
                     if rec.status == "vectorized":
                         changes += 1
-                        i = self._skip_rewritten(region, rec)
+                        i = self._skip_rewritten(block, region, rec)
                         continue
                     warnings.append(
                         f"loop {rec.function}:{rec.block}[{rec.index}] "
@@ -231,14 +246,31 @@ class Vectorizer(CompilerPass):
                     )
         return None
 
-    def _skip_rewritten(self, region: _LoopRegion,
+    def _skip_rewritten(self, block: BasicBlock, region: _LoopRegion,
                         rec: LoopVectorizationRecord) -> int:
-        """Index of the instruction after the rewritten region."""
-        next_index = region.end_index + 1
-        if rec.remainder:
-            body_len = region.end_index - region.for_index - 1
-            next_index += 1 + body_len + 1
-        return next_index
+        """Index of the instruction after the rewritten region.
+
+        The rewritten region contains one top-level ``FOR`` (the strip
+        loop) plus, when there is a remainder, a second one inserted
+        directly after the strip ``ENDFOR``.  The original ``end_index``
+        is stale after the rewrite, so the position is found by scanning
+        the block for the matching top-level ``ENDFOR`` (review F1).
+        """
+        target = 2 if rec.remainder else 1
+        depth = 0
+        closed = 0
+        for j in range(region.for_index, len(block.instructions)):
+            op = block.instructions[j].opcode
+            if op is OpCode.FOR:
+                depth += 1
+            elif op is OpCode.ENDFOR:
+                depth -= 1
+                if depth == 0:
+                    closed += 1
+                    if closed == target:
+                        return j + 1
+        # Defensive: the rewrite always produces the expected loops.
+        return region.end_index + 1
 
     # ── Decision tree (design doc 2.2.1 C1–C7) ──────────────────────────
 
@@ -290,12 +322,19 @@ class Vectorizer(CompilerPass):
             return self._reject(rec, REASON_NO_ELEMENT_PATTERN)
 
         # C7: aliasing stores (shallow, conservative base analysis).
-        reason = self._alias_reason(mem_refs)
+        reason = self._alias_reason(mem_refs, n)
         if reason is not None:
             return self._reject(rec, reason)
 
         # C6: the induction variable may only feed canonical address MULs.
         reason = self._iv_use_reason(region.body, iv_name)
+        if reason is not None:
+            return self._reject(rec, reason)
+
+        # C6 (live-out): values defined inside the region (including the
+        # original induction variable) must not be used outside it — the
+        # rewrite replaces or drops those definitions (review F2).
+        reason = self._region_escape_reason(func, region, defs, iv_name)
         if reason is not None:
             return self._reject(rec, reason)
 
@@ -312,8 +351,9 @@ class Vectorizer(CompilerPass):
             return self._reject(rec, reason)
 
         original_iv = region.for_instr.dest
-        vector_ops = self._rewrite(block, region, plan)
-        self._clone_remainder(block, region, plan, original_iv)
+        vector_ops, new_end_index = self._rewrite(block, region, plan)
+        self._clone_remainder(block, region, plan, original_iv,
+                              new_end_index)
 
         rec.status = "vectorized"
         rec.reason = ""
@@ -384,25 +424,93 @@ class Vectorizer(CompilerPass):
         return _MemRef(instr=instr, index=index, base=base,
                        offset=offset, canonical=canonical)
 
-    def _alias_reason(self, mem_refs: list[_MemRef]) -> Optional[str]:
-        loads: dict[str, list[_MemRef]] = {}
-        stores: dict[str, list[_MemRef]] = {}
+    def _alias_reason(self, mem_refs: list[_MemRef],
+                      n: int) -> Optional[str]:
+        """C7: conservative aliasing check (review F3).
+
+        Two references on the *same* base are only safe when the accesses
+        are the canonical element chain with at most one store and one
+        load and both use the same lane offset (in-place patterns).  Two
+        references on *different* base names are only safe when both
+        bases are constant absolute addresses with provably disjoint
+        ``[base, base + n*elem_bytes)`` byte ranges; anything else is
+        rejected because a shallow name-based analysis cannot rule out
+        overlap (e.g. ``src = sub(out, 4)``).
+        """
+        by_base: dict[str, list[_MemRef]] = {}
         for ref in mem_refs:
             if ref.base is None:
+                # Addresses that are not a canonical element chain are
+                # rejected later by classification; they never receive a
+                # vector form, so they cannot be reordered here.
                 continue
-            bucket = loads if ref.is_load else stores
-            bucket.setdefault(ref.base.name, []).append(ref)
+            by_base.setdefault(ref.base.name, []).append(ref)
 
-        for base_name, store_refs in stores.items():
+        for base_name, refs in by_base.items():
+            store_refs = [ref for ref in refs if not ref.is_load]
             if len(store_refs) > 1:
                 return REASON_ALIASING_STORE
-            if base_name not in loads:
+            if not store_refs:
                 continue
-            load_refs = loads[base_name]
+            load_refs = [ref for ref in refs if ref.is_load]
+            if not load_refs:
+                continue
             if len(load_refs) != 1:
                 return REASON_ALIASING_STORE
             if load_refs[0].lane_key != store_refs[0].lane_key:
                 return REASON_ALIASING_STORE
+
+        store_bases = [
+            name for name, refs in by_base.items()
+            if any(not ref.is_load for ref in refs)
+        ]
+        for store_name in store_bases:
+            store_base = by_base[store_name][0].base
+            for other_name, other_refs in by_base.items():
+                if other_name == store_name:
+                    continue
+                if not self._provably_disjoint(
+                        store_base, other_refs[0].base, n):
+                    return REASON_ALIASING_STORE
+        return None
+
+    def _provably_disjoint(self, lhs: Optional[Value],
+                           rhs: Optional[Value], n: int) -> bool:
+        """True when two constant bases cannot overlap over *n* elements."""
+        if lhs is None or rhs is None:
+            return False
+        if not all(value.is_constant and value.const_value is not None
+                   and _is_int(value.const_value) for value in (lhs, rhs)):
+            return False
+        span = n * self.elem_bytes
+        assert lhs.const_value is not None and rhs.const_value is not None
+        return abs(int(lhs.const_value) - int(rhs.const_value)) >= span
+
+    def _region_escape_reason(self, func: Function, region: _LoopRegion,
+                              defs: dict[str, Instruction],
+                              iv_name: str) -> Optional[str]:
+        """C6 live-out: no region-local definition may escape the region.
+
+        ``_rewrite`` replaces or drops every definition inside
+        ``region.body`` and redefines the ``FOR`` destination as the strip
+        index, so a use of any of those values outside the region would
+        become a dangling SSA reference (review F2).  Checking the whole
+        function also covers the remainder-less case where the original
+        induction variable is never redefined.
+        """
+        local_names = set(defs)
+        if iv_name:
+            local_names.add(iv_name)
+        if not local_names:
+            return None
+        body_ids = {id(instr) for instr in region.body}
+        for block in func.blocks:
+            for instr in block.instructions:
+                if id(instr) in body_ids:
+                    continue
+                for op in instr.operands:
+                    if op.name in local_names:
+                        return REASON_REGION_VALUE_ESCAPES
         return None
 
     def _iv_use_reason(self, body: list[Instruction],
@@ -500,7 +608,14 @@ class Vectorizer(CompilerPass):
     # ── Rewrite (strip-mining) ──────────────────────────────────────────
 
     def _rewrite(self, block: BasicBlock, region: _LoopRegion,
-                 plan: _Plan) -> int:
+                 plan: _Plan) -> tuple[int, int]:
+        """Rewrite the region in place.
+
+        Returns ``(vector_ops, new_end_index)`` where ``new_end_index`` is
+        the position of the strip ``ENDFOR`` *after* the body replacement
+        (``region.end_index`` is stale once ``new_body`` changes length;
+        review F1).
+        """
         old_iv = region.for_instr.dest
         iv_dtype = old_iv.dtype if old_iv is not None else DataType.INT32
         strip_iv = Value(name=self._fresh("v"), dtype=iv_dtype)
@@ -603,7 +718,8 @@ class Vectorizer(CompilerPass):
             "orig_trip": plan.n,
         }
         block.instructions[region.for_index + 1:region.end_index] = new_body
-        return vector_ops
+        new_end_index = region.for_index + 1 + len(new_body)
+        return vector_ops, new_end_index
 
     def _element_value(self, value: Value, plan: _Plan,
                        val_map: dict[str, Value],
@@ -625,7 +741,15 @@ class Vectorizer(CompilerPass):
             f"vectorizer internal error: no vector form for '{value.name}'")
 
     def _clone_remainder(self, block: BasicBlock, region: _LoopRegion,
-                         plan: _Plan, original_iv: Optional[Value]) -> int:
+                         plan: _Plan, original_iv: Optional[Value],
+                         new_end_index: int) -> int:
+        """Insert the scalar remainder loop after the rewritten region.
+
+        ``new_end_index`` is the strip ``ENDFOR`` position returned by
+        ``_rewrite``; inserting at any other index either nests the
+        remainder inside the strip loop or leaves it after ``return``
+        (review F1).
+        """
         if plan.remainder == 0:
             return 0
         new_for = Instruction(
@@ -634,7 +758,7 @@ class Vectorizer(CompilerPass):
                    "end": plan.n, "step": 1})
         cloned = self._clone_instrs(region.body)
         endfor = Instruction(opcode=OpCode.ENDFOR)
-        insert_at = region.end_index + 1
+        insert_at = new_end_index + 1
         block.instructions[insert_at:insert_at] = [new_for, *cloned, endfor]
         return 1
 
