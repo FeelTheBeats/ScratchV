@@ -222,18 +222,32 @@ class Inliner:
         if self.config.reject_loops and _has_loop(callee):
             return False, "loop_body_unsupported"
 
-        valued = [
+        rets = [
             ins
             for b in callee.blocks
             for ins in b.instructions
-            if ins.opcode is OpCode.RETURN and ins.operands
+            if ins.opcode is OpCode.RETURN
         ]
+        valued = [ins for ins in rets if ins.operands]
+        if not rets:
+            # A callee without RETURN cannot terminate the cloned blocks.
+            return False, "missing_return"
         if len(valued) > 1:
             return False, "multiple_valued_returns"
+        if valued and len(valued) != len(rets):
+            # Mixed valued/void returns: the void paths would jump to the
+            # continuation without defining the substituted return value.
+            return False, "ret_arity_mismatch"
         if valued and call.dest is None and not self.config.allow_ret_drop:
             return False, "ret_arity_mismatch"
         if not valued and call.dest is not None:
             return False, "ret_arity_mismatch"
+
+        undefined = self._undefined_operand(callee)
+        if undefined is not None:
+            # Dangling uses (e.g. cross-block definitions removed by the
+            # block-local DCE) must not be cloned into the caller.
+            return False, f"undefined_operand ({undefined})"
 
         size = _body_size(callee)
         if size > self.config.max_instrs:
@@ -244,6 +258,37 @@ class Inliner:
         if self.config.single_site_only and self._count_sites(callee) > 1:
             return False, "multiple_call_sites"
         return True, ""
+
+    def _undefined_operand(self, callee: Function) -> Optional[str]:
+        """Return the name of a callee operand that has no definition.
+
+        The inliner clones callee instructions verbatim, so a callee that
+        already contains dangling uses (for example after the existing
+        block-local DCE removed a cross-block definition) would silently
+        propagate them into the caller.  Such callees are rejected instead.
+        """
+        defined_ids: set[int] = set()
+        defined_names: set[str] = set()
+        for val in self.program.global_values:
+            defined_ids.add(id(val))
+            defined_names.add(val.name)
+        for val in list(callee.params) + list(callee.locals):
+            defined_ids.add(id(val))
+            defined_names.add(val.name)
+        for block in callee.blocks:
+            for ins in block.instructions:
+                if ins.dest is not None:
+                    defined_ids.add(id(ins.dest))
+                    defined_names.add(ins.dest.name)
+        for block in callee.blocks:
+            for ins in block.instructions:
+                for val in ins.operands:
+                    if val.is_constant:
+                        continue
+                    if id(val) in defined_ids or val.name in defined_names:
+                        continue
+                    return val.name
+        return None
 
     def _inline_site(self, caller: Function, block: BasicBlock, idx: int,
                      call: Instruction, callee: Function, k: int) -> None:
@@ -295,7 +340,10 @@ class Inliner:
                     dest=map_value(ins.dest) if ins.dest is not None else None,
                     operands=[map_value(v) for v in ins.operands],
                     attrs=dict(ins.attrs),
-                    target=_rewrite_target(ins.target, block_map),
+                    # CALL targets are function names, not block names and
+                    # must never be rewritten by the block name map.
+                    target=(ins.target if ins.opcode is OpCode.CALL
+                            else _rewrite_target(ins.target, block_map)),
                 ))
 
         tail = block.instructions[idx + 1:]

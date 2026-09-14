@@ -67,4 +67,7 @@ class DeadCodeEliminator:
             OpCode.FOR,
             OpCode.ENDFOR,
             OpCode.ALLOCA,
+            # CALL may execute arbitrary side effects in the callee and
+            # must never be removed even when its result is unused.
+            OpCode.CALL,
         )

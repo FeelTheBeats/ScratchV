@@ -27,6 +27,7 @@ class InstructionSelector:
         self._current_function_name = ""
         self._instructions: list[MachineInstr] = []
         self._label_counter = 0
+        self._call_counter = 0
 
     def run(self) -> list[MachineInstr]:
         """Select instructions for all functions.
@@ -259,9 +260,20 @@ class InstructionSelector:
                 f"'{self._current_function_name}': ABI support "
                 f"(prologue/epilogue, stack args) is not implemented; "
                 f"enable inlining (--inline) or set minimal_call_codegen=True")
+        # Parallel-safe argument staging: read every argument into a fresh
+        # temporary first, then write the a{i} registers.  A plain sequential
+        # "mv a{i}, arg" sequence can clobber a source that already lives in
+        # an a-register (register allocation only sees virtual registers).
+        self._call_counter += 1
+        temps = []
         for i, _ in enumerate(args):
+            temp = f"_call_arg{i}_{self._call_counter}"
+            temps.append(temp)
+            self._emit(MachineOp.MV, MachineOperand.vreg(temp),
+                       self._op(instr, i), comment=f"arg{i} -> tmp")
+        for i, temp in enumerate(temps):
             self._emit(MachineOp.MV, MachineOperand.reg(f"a{i}"),
-                       self._op(instr, i), comment=f"arg{i} -> a{i}")
+                       MachineOperand.vreg(temp), comment=f"tmp -> a{i}")
         self._emit(MachineOp.JAL, MachineOperand.reg("ra"),
                    comment=callee)
         if instr.dest is not None:

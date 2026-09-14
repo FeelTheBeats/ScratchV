@@ -103,11 +103,12 @@ class LICM:
     def _is_invariant(self, instr: Instruction, variant_names: set[str],
                       loop_defs: set[str]) -> bool:
         """Check if an instruction is loop-invariant."""
-        # Control flow and store instructions are never invariant
+        # Control flow, store and call instructions are never invariant:
+        # hoisting a CALL would change how often the callee runs.
         if instr.opcode in (
                 OpCode.STORE, OpCode.BR, OpCode.BR_IF,
                 OpCode.RETURN, OpCode.FOR, OpCode.ENDFOR,
-                OpCode.LABEL):
+                OpCode.LABEL, OpCode.CALL):
             return False
         # An instruction is invariant if all its operands are:
         # - constants, or

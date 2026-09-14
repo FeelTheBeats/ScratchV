@@ -9,6 +9,7 @@ from __future__ import annotations
 from scratchv.ir.types import (
     OpCode, DataType, Value, Instruction, BasicBlock, Function, Program,
 )
+from scratchv.backend.instruction_select import UnsupportedCallError
 
 
 _TYPE_MAP = {
@@ -173,6 +174,15 @@ class LLVMCodegen:
     # ------------------------------------------------------------------
 
     def _emit_instruction(self, instr: Instruction) -> None:
+        if instr.opcode is OpCode.CALL:
+            # No calling convention is modelled by this backend; emitting
+            # the call text would produce invalid .ll referencing undefined
+            # values.  Fail loud instead, mirroring the RISC-V backend.
+            raise UnsupportedCallError(
+                f"CALL {instr.target} in function "
+                f"'{self._current_func}': the LLVM backend does not lower "
+                f"CALL (ABI not implemented); enable inlining (--inline) or "
+                f"use the RISC-V backend")
         handler = getattr(self, f"_emit_{instr.opcode.value}", None)
         if handler is None:
             ops = ' '.join(str(v.name) for v in instr.operands)

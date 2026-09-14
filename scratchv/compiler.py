@@ -330,7 +330,7 @@ class CompilerDriver:
         except Exception as e:
             return CompileResult(
                 success=False, errors=[f"Codegen error: {e}"],
-                ir_dump=ir_dump,
+                ir_dump=ir_dump, warnings=warnings,
             )
 
         # --- 5. Post-codegen passes ---
@@ -467,7 +467,15 @@ class CompilerDriver:
                 LinearScanAllocator, block_from_machine_instrs,
             )
             ls_insts = block_from_machine_instrs(machine_instrs)
-            lsa = LinearScanAllocator()
+            phys_regs = None
+            if self.config.minimal_call_codegen and _program_has_call(program):
+                # Reserve a0..a7 for the CALL staging sequence: the allocator
+                # does not model the physical argument writes, so a vreg
+                # mapped to an argument register could be silently clobbered.
+                # The greedy allocator already only uses ALL_REGS.
+                from scratchv.backend.machine_types import ALL_REGS
+                phys_regs = list(ALL_REGS)
+            lsa = LinearScanAllocator(phys_regs=phys_regs)
             return lsa.emit(ls_insts)
 
         alloc = RegisterAllocator(machine_instrs, mode=self.config.reg_alloc)
@@ -542,6 +550,17 @@ class CompilerDriver:
             warnings.append(f"Instruction count: {total}")
 
         return asm_text
+
+
+def _program_has_call(program) -> bool:
+    """Return True if any function of *program* contains a CALL."""
+    from scratchv.ir.types import OpCode
+    return any(
+        ins.opcode is OpCode.CALL
+        for func in program.functions
+        for block in func.blocks
+        for ins in block.instructions
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

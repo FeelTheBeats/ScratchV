@@ -306,6 +306,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             for err in result.errors:
                 print(f"Error: {err}", file=sys.stderr)
+        for w in result.warnings:
+            print(f"  note: {w}", file=sys.stderr)
         return 1
 
 
