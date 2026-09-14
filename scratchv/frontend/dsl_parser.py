@@ -31,7 +31,7 @@ from scratchv.frontend.dsl_errors import (
     suggest_spelling,
     _ARITY_HINTS,
 )
-from scratchv.frontend.dsl_validator import DSLValidator
+from scratchv.frontend.dsl_validator import DSLValidator, OP_SIGNATURES
 from scratchv.ir.builder import IRBuilder
 from scratchv.ir.types import Value, Program
 
@@ -60,6 +60,9 @@ _ARITY: dict[str, int] = {
     "softmax": 1,
     "maxpool": 1,
 }
+
+# Numeric literal accepted for numeric kwargs (mirrors validator `_NUMBER`).
+_NUMBER = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)")
 
 
 class DSLParser:
@@ -179,7 +182,7 @@ class DSLParser:
             if preflight.has_errors:
                 raise preflight.errors[0]
 
-        raw_lines = text.split("\n")
+        raw_lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
         self.builder = IRBuilder()
         self._vars = {}
@@ -222,7 +225,7 @@ class DSLParser:
         indent = self._line_indent(line_no)
 
         # for i = start, end
-        m = re.match(r"for\s+(\w+)\s*=\s*(\d+)\s*,\s*(\d+)", line)
+        m = re.fullmatch(r"for\s+(\w+)\s*=\s*(\d+)\s*,\s*(\d+)", line)
         if m:
             iv = self.builder.for_loop(int(m.group(2)), int(m.group(3)))
             self._vars[m.group(1)] = iv
@@ -246,7 +249,7 @@ class DSLParser:
             return
 
         # return [var]
-        m = re.match(r"return\s*(\S+)", line)
+        m = re.fullmatch(r"return\s+(\S+)", line)
         if m:
             val = self._resolve(m.group(1))
             self.builder.ret(val)
@@ -334,16 +337,52 @@ class DSLParser:
         return v
 
     def _parse_kwargs(
-            self, args: list[str],
-    ) -> tuple[list[str], dict[str, int | float | str]]:
+            self, args: list[str], op: str,
+            line_no: int = 0, col: int = 1,
+    ) -> Optional[tuple[list[str], dict[str, int | float | str]]]:
+        """Split ``args`` into plain and keyword arguments.
+
+        Keyword arguments are validated against the operator signature
+        (``OP_SIGNATURES``): unknown keys and non-numeric values for numeric
+        kwargs are reported as E304. Returns ``None`` when an error was
+        reported (strict mode raises before returning).
+        """
+        signature = OP_SIGNATURES.get(op)
+        allowed = (
+            signature.optional_kwargs | signature.required_kwargs
+            if signature is not None
+            else frozenset()
+        )
+        numeric = (
+            signature.numeric_kwargs if signature is not None else frozenset()
+        )
         kwargs: dict[str, int | float | str] = {}
         plain: list[str] = []
         for a in args:
-            if ":" in a:
-                k, v = a.split(":", 1)
-                kwargs[k.strip()] = self._parse_value(v.strip())
-            else:
+            if ":" not in a:
                 plain.append(a)
+                continue
+            k, v = a.split(":", 1)
+            k = k.strip()
+            v = v.strip()
+            err_col = self._col_of(line_no, k, col)
+            if k not in allowed:
+                self._report_error(
+                    line_no, err_col,
+                    f"invalid keyword argument '{k}'",
+                    ErrorCode.SEM_UNKNOWN_KWARG,
+                    fix_hint=f"'{k}' is not accepted by {op}()",
+                )
+                return None
+            if k in numeric and _NUMBER.fullmatch(v) is None:
+                self._report_error(
+                    line_no, err_col,
+                    f"'{k}' requires a numeric value",
+                    ErrorCode.SEM_UNKNOWN_KWARG,
+                    fix_hint=f"pass a number for '{k}', got '{v}'",
+                )
+                return None
+            kwargs[k] = self._parse_value(v)
         return plain, kwargs
 
     def _parse_value(self, s: str) -> int | float | str:
@@ -407,7 +446,10 @@ class DSLParser:
             )
             return None
 
-        plain, kwargs = self._parse_kwargs(args)
+        parsed = self._parse_kwargs(args, op, line_no, col)
+        if parsed is None:
+            return None
+        plain, kwargs = parsed
         expected = _ARITY.get(op)
         if expected is not None and len(plain) != expected:
             hint = _ARITY_HINTS.get(op)

@@ -72,6 +72,7 @@ class ErrorCode:
     # Semantic
     SEM_UNKNOWN_OP = "E301"
     SEM_ARITY = "E302"
+    SEM_UNKNOWN_KWARG = "E304"
 
 
 # ---------------------------------------------------------------------------
@@ -470,10 +471,18 @@ class ErrorCollector:
         Args:
             filename: Source filename for display.
             use_color: Whether to use ANSI colors in output.
-            max_errors: Maximum number of stored errors.
+            max_errors: Maximum number of stored errors (must be >= 1).
             source: Full source text used for context rendering.
             context_lines: Context lines shown before each error line.
+
+        Raises:
+            ValueError: If ``max_errors`` is less than 1 (a zero limit would
+                silently report "no errors" while suppressing everything).
         """
+        if max_errors < 1:
+            raise ValueError(
+                f"max_errors must be >= 1, got {max_errors}"
+            )
         self.filename = filename
         self.use_color = use_color
         self.max_errors = max_errors
@@ -521,11 +530,11 @@ class ErrorCollector:
         )
         if key in self._keys:
             return
+        self._keys.add(key)
         if len(self._errors) >= self.max_errors:
             self.limit_reached = True
             self._suppressed += 1
             return
-        self._keys.add(key)
         self._errors.append(err)
 
     def add_error(

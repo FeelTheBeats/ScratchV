@@ -154,7 +154,7 @@ class ExtendedDSLParser(DSLParser):
             if preflight.has_errors:
                 raise preflight.errors[0]
 
-        raw_lines = text.split("\n")
+        raw_lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
         lines: list[str] = []
         for raw in raw_lines:
             line = raw.strip()
