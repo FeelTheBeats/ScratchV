@@ -232,7 +232,10 @@ class TestLoggerDefectRegressions:
         assert old_file.stream is None
         new_handlers = list(logging.getLogger("scratchv").handlers)
         assert len(new_handlers) == 2
-        assert logging.getLogger("scratchv").level == logging.INFO
+        # With a file handler the root logger stays at DEBUG so the file
+        # receives DEBUG records; the console handler carries the level (F1).
+        assert logging.getLogger("scratchv").level == logging.DEBUG
+        assert logger_mod._console_handler.level == logging.INFO
 
     def test_shutdown_resets_state(self):
         init_logger(level="DEBUG")
@@ -248,10 +251,57 @@ class TestLoggerDefectRegressions:
         log.info("revived logger")
         shutdown()
 
-    def test_set_level_updates_console_only(self, tmp_path):
-        init_logger(level="INFO", log_file=str(tmp_path / "a.log"))
+    def test_set_level_updates_console_only(self, tmp_path, capsys):
+        log_path = tmp_path / "a.log"
+        init_logger(level="INFO", log_file=str(log_path))
+        root = logging.getLogger("scratchv")
+        assert root.level == logging.DEBUG
+
         set_level("WARNING")
         assert logger_mod._console_handler.level == logging.WARNING
         assert logger_mod._file_handler.level == logging.DEBUG
+        assert root.level == logging.DEBUG
         assert logger_mod._config["level"] == "WARNING"
+
+        # Verify actual routing, not just handler levels: INFO is dropped on
+        # the console but still recorded in the file.
+        log = get_logger("test.setlevel")
+        log.info("info-suppressed-on-console")
+        log.warning("warning-shown")
         shutdown()
+
+        err = capsys.readouterr().err
+        text = log_path.read_text()
+        assert "info-suppressed-on-console" not in err
+        assert "warning-shown" in err
+        assert "info-suppressed-on-console" in text
+        assert "warning-shown" in text
+
+    def test_log_file_only_contains_debug(self, tmp_path, capsys):
+        log_path = tmp_path / "debug.log"
+        init_logger(level="INFO", log_file=str(log_path), use_color=False)
+        log = get_logger("test.debug_file")
+        log.debug("debug-only-line")
+        log.info("info-line")
+        shutdown()
+
+        err = capsys.readouterr().err
+        text = log_path.read_text()
+
+        assert "debug-only-line" in text
+        assert "info-line" in text
+        assert "debug-only-line" not in err
+        assert "info-line" in err
+
+    def test_log_file_error_resets_state(self, tmp_path, capsys):
+        bad_path = tmp_path / "missing_dir" / "x.log"
+        with pytest.raises(logger_mod.LogFileError):
+            init_logger(level="INFO", log_file=str(bad_path))
+
+        # No half-initialized logger is left behind.
+        assert logger_mod._initialized is False
+        assert logger_mod._root_logger is None
+        assert logger_mod._console_handler is None
+        assert logger_mod._file_handler is None
+        assert logging.getLogger("scratchv").handlers == []
+        assert capsys.readouterr().err == ""

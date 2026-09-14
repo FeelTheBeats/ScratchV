@@ -11,11 +11,14 @@ from pathlib import Path
 import pytest
 
 import scratchv.utils.logger as logger_mod
+from scratchv.compiler import CompilerConfig, CompilerDriver
 from scratchv.main import args_to_config, build_arg_parser, main
 from scratchv.utils.logger import shutdown
 
 DSL = (Path(__file__).resolve().parent.parent
        / "benchmarks" / "cases" / "001_simple_add.dsl")
+ONNX = (Path(__file__).resolve().parent.parent
+        / "models" / "graph" / "cnn.onnx")
 
 
 @pytest.fixture(autouse=True)
@@ -86,3 +89,146 @@ def test_no_logging_by_default_keeps_outputs_stable(tmp_path, capsys):
     assert captured.out == ""
     assert "scratchv.compiler" not in captured.err
     assert captured.err.strip() == f"OK RISCV output written to {out}"
+
+
+def test_compile_failure_logged(tmp_path, capsys):
+    bad = tmp_path / "bad.dsl"
+    bad.write_text("add(a, b\n", encoding="utf-8")
+    log_file = tmp_path / "fail.log"
+
+    rc = main([str(bad), "-o", str(tmp_path / "out.s"),
+               "--log-level", "DEBUG", "--log-file", str(log_file)])
+    captured = capsys.readouterr()
+
+    assert rc == 1
+    assert captured.out == ""
+    text = log_file.read_text()
+    assert "ERROR" in text
+    assert "compilation failed" in text
+    assert "error[E" in text
+
+
+def test_parse_failure_logged(tmp_path, monkeypatch, capsys):
+    def bad_parse(self, input_path, dsl_source=None):
+        raise ValueError("parse exploded")
+
+    monkeypatch.setattr(CompilerDriver, "_parse", bad_parse)
+    log_file = tmp_path / "parse.log"
+    rc = main(["model.onnx", "-o", str(tmp_path / "out.s"),
+               "--log-level", "DEBUG", "--log-file", str(log_file)])
+    capsys.readouterr()
+
+    assert rc == 1
+    text = log_file.read_text()
+    assert "ERROR" in text
+    assert "compilation failed: parse exploded" in text
+
+
+def test_codegen_failure_logged(tmp_path, monkeypatch, capsys):
+    def bad_codegen(self, program):
+        raise ValueError("codegen exploded")
+
+    monkeypatch.setattr(CompilerDriver, "_generate_code", bad_codegen)
+    log_file = tmp_path / "codegen.log"
+    rc = main([str(DSL), "-o", str(tmp_path / "out.s"),
+               "--log-level", "DEBUG", "--log-file", str(log_file)])
+    capsys.readouterr()
+
+    assert rc == 1
+    text = log_file.read_text()
+    assert "ERROR" in text
+    assert "compilation failed: codegen exploded" in text
+    assert "FAILED" in text
+
+
+def test_log_file_same_as_input_refused(tmp_path, capsys):
+    src = tmp_path / "input.dsl"
+    src.write_text(DSL.read_text(encoding="utf-8"), encoding="utf-8")
+    original = src.read_text(encoding="utf-8")
+
+    rc = main([str(src), "-o", str(tmp_path / "out.s"),
+               "--log-file", str(src)])
+    captured = capsys.readouterr()
+
+    assert rc == 2
+    assert src.read_text(encoding="utf-8") == original
+    assert "log file" in captured.err
+    assert "would overwrite input" in captured.err
+    assert "Traceback" not in captured.err
+
+    rc2 = main([str(DSL), "-o", str(tmp_path / "out2.s"),
+                "--log-file", str(tmp_path / "out2.s")])
+    captured2 = capsys.readouterr()
+
+    assert rc2 == 2
+    assert "would overwrite output" in captured2.err
+
+
+def test_log_file_bad_path_error(tmp_path, capsys):
+    bad = tmp_path / "missing_dir" / "x.log"
+
+    rc = main([str(DSL), "-o", str(tmp_path / "out.s"),
+               "--log-file", str(bad)])
+    captured = capsys.readouterr()
+
+    assert rc == 2
+    assert "cannot open log file" in captured.err
+    assert "Traceback" not in captured.err
+    assert logger_mod._initialized is False
+    assert logger_mod._root_logger is None
+
+    if ONNX.exists():
+        rc2 = main([str(ONNX), "-o", str(tmp_path / "out2.s"),
+                    "--log-file", str(bad)])
+        captured2 = capsys.readouterr()
+
+        assert rc2 == 2
+        assert "cannot open log file" in captured2.err
+        assert "Traceback" not in captured2.err
+
+
+def test_driver_reuse_after_shutdown_keeps_file(tmp_path, capsys):
+    log_file = tmp_path / "reuse.log"
+    config = CompilerConfig(
+        use_logger=True, log_level="INFO",
+        log_file=str(log_file), log_color=False,
+    )
+    driver = CompilerDriver(config)
+
+    first = driver.compile(str(DSL), str(tmp_path / "a.s"))
+    assert first.success
+
+    shutdown()
+    capsys.readouterr()
+
+    second = driver.compile(str(DSL), str(tmp_path / "b.s"))
+    captured = capsys.readouterr()
+
+    assert second.success
+    # The second run must honour the driver config instead of silently
+    # falling back to the default logger (no file, colored, INFO).
+    assert logger_mod._file_handler is not None
+    assert logger_mod._config.get("log_file") == str(log_file)
+    assert "\033[" not in captured.err
+    assert "compilation succeeded" in log_file.read_text()
+
+
+def test_pass_exception_logs_traceback(tmp_path, monkeypatch, capsys):
+    from scratchv.optimizer.constant_folding import ConstantFolder
+
+    def boom(self):
+        raise RuntimeError("simulated pass failure")
+
+    monkeypatch.setattr(ConstantFolder, "run", boom)
+    log_file = tmp_path / "pass.log"
+
+    rc = main([str(DSL), "-o", str(tmp_path / "out.s"),
+               "--optimize", "all", "--log-level", "DEBUG",
+               "--log-file", str(log_file)])
+    capsys.readouterr()
+
+    assert rc == 0  # E2: the pass failure is swallowed by design
+    text = log_file.read_text()
+    assert "pass 'constant-folding' failed" in text
+    assert "Traceback (most recent call last)" in text
+    assert "RuntimeError: simulated pass failure" in text
