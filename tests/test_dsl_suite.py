@@ -9,6 +9,8 @@ Failures already located, owned and declared in ``*.meta.json`` are marked
 from __future__ import annotations
 
 import json
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -19,14 +21,23 @@ from benchmarks.dsl_suite import (
     ORACLE_NONE,
     STAGE_ASSEMBLE,
     STAGE_BUDGET,
+    STAGE_COMPILE,
     STAGE_SEMANTIC,
+    STATUS_FAIL,
+    STATUS_XFAIL,
+    STATUS_XPASS,
+    CaseOutcome,
     CaseSpec,
+    CompileOutcome,
     DSLSuiteRunner,
+    ExecutionOracle,
     SemanticOutcome,
+    SuiteReport,
     compare_values,
     discover_cases,
     load_case_spec,
 )
+from benchmarks.run_suite import _print_summary
 
 ALL_CASES: tuple[CaseSpec, ...] = tuple(discover_cases())
 if not ALL_CASES:
@@ -117,7 +128,7 @@ def test_meta_contract(case: CaseSpec) -> None:
         assert case.xfail.reason.strip(), "xfail.reason must be non-empty"
 
 
-@pytest.mark.parametrize("case", params_for(None))
+@pytest.mark.parametrize("case", params_for(STAGE_COMPILE))
 def test_compile_ok(case: CaseSpec, compile_results: dict) -> None:
     if case.skip_reason:
         pytest.skip(case.skip_reason)
@@ -233,3 +244,265 @@ def test_meta_contract_rejects_invalid_metadata(
     assert any(fragment in error for error in spec.meta_errors), (
         f"expected {fragment!r} in {spec.meta_errors}"
     )
+
+
+MANUAL_LOOP_ASM = (
+    "addi a0, zero, 0\n"
+    "addi t0, zero, 0\n"
+    "addi t1, zero, 4\n"
+    "loop:\n"
+    "addi a0, a0, 1\n"
+    "addi t0, t0, 1\n"
+    "blt t0, t1, loop\n"
+    "jalr zero, ra\n"
+)
+
+INFINITE_LOOP_ASM = (
+    "addi t0, zero, 0\n"
+    "loop:\n"
+    "addi t0, t0, 1\n"
+    "j loop\n"
+)
+
+
+def _require_tinyfive() -> None:
+    if not ExecutionOracle().available():
+        pytest.skip("tinyfive not installed")
+
+
+def test_execution_oracle_completes_manual_loop() -> None:
+    """F1 regression: static word count must not truncate dynamic loops."""
+    _require_tinyfive()
+    outcome = ExecutionOracle().execute(MANUAL_LOOP_ASM, {}, {}, timeout_s=5.0)
+    assert outcome.error is None, outcome.error
+    assert outcome.blocked_reason is None
+    assert outcome.actual == 4
+
+
+def test_execution_oracle_validates_compiled_code(
+    tmp_path: Path, suite_runner: DSLSuiteRunner,
+) -> None:
+    """F1/F3 regression: green codegen + simulation path for the oracle."""
+    dsl_path = _write_pseudo_case(
+        tmp_path,
+        "execution_add",
+        "c = add(a, b)\nreturn c\n",
+        {
+            "description": "codegen+execution probe",
+            "oracle": "execution",
+            "inputs": {"a": 2, "b": 3},
+            "input_registers": {"a": "a0", "b": "a1"},
+            "expected_return": 5,
+        },
+    )
+    spec = load_case_spec(dsl_path, tmp_path)
+    assert spec.meta_errors == (), spec.meta_errors
+    _require_tinyfive()
+    compile_outcome = suite_runner.compile_case(spec)
+    assert compile_outcome.ok, compile_outcome.error
+    outcome = suite_runner.evaluate_semantics(spec, compile_outcome)
+    assert outcome.ok is True, outcome.blocked_reason or outcome.error
+
+
+def test_execution_oracle_times_out() -> None:
+    """F6 regression: timeout_s must bound a non-terminating execution."""
+    _require_tinyfive()
+    started = time.perf_counter()
+    outcome = ExecutionOracle().execute(
+        INFINITE_LOOP_ASM, {}, {}, timeout_s=0.1,
+    )
+    elapsed = time.perf_counter() - started
+    assert outcome.ok is False
+    assert outcome.error is not None and "timeout" in outcome.error
+    assert elapsed < 5.0
+
+
+def test_runner_timeout_budget_caps_execution(tmp_path: Path) -> None:
+    """F6 regression: the runner/CLI budget reaches the execution oracle."""
+    dsl_path = _write_pseudo_case(
+        tmp_path,
+        "timeout_case",
+        "c = add(a, b)\nreturn c\n",
+        {
+            "description": "timeout budget probe",
+            "oracle": "execution",
+            "inputs": {"a": 1, "b": 2},
+            "input_registers": {"a": "a0", "b": "a1"},
+            "expected_return": 3,
+            "timeout_s": 30.0,
+        },
+    )
+    spec = load_case_spec(dsl_path, tmp_path)
+    assert spec.meta_errors == (), spec.meta_errors
+    _require_tinyfive()
+    runner = DSLSuiteRunner(roots=(tmp_path,), timeout_s=0.1)
+    try:
+        synthetic = CompileOutcome(
+            ok=True, asm_text=INFINITE_LOOP_ASM, output_path=None,
+            ir_instruction_count=0, duration_s=0.0, error=None,
+        )
+        outcome = runner.evaluate_semantics(spec, synthetic)
+        assert outcome.ok is False
+        assert outcome.error is not None and "timeout" in outcome.error
+    finally:
+        runner.cleanup()
+
+
+def test_blocked_semantic_without_xfail_is_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F4 regression: uncovered blocked stages must be hard failures."""
+    dsl_path = _write_pseudo_case(
+        tmp_path,
+        "blocked_execution",
+        "c = add(a, b)\nreturn c\n",
+        {
+            "description": "blocked semantic probe",
+            "oracle": "execution",
+            "inputs": {"a": 1, "b": 2},
+            "input_registers": {"a": "a0", "b": "a1"},
+            "expected_return": 3,
+        },
+    )
+    spec = load_case_spec(dsl_path, tmp_path)
+    assert spec.meta_errors == (), spec.meta_errors
+    assert spec.xfail is None
+    monkeypatch.setattr(ExecutionOracle, "available", lambda self: False)
+    runner = DSLSuiteRunner(roots=(tmp_path,))
+    try:
+        outcome = runner.run_case(spec)
+    finally:
+        runner.cleanup()
+    assert outcome.status == STATUS_FAIL
+    assert outcome.error_stage == STAGE_SEMANTIC
+
+
+def test_compile_stage_xfail_is_injected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F5 regression: xfail(compile) must reach the compile test node."""
+    dsl_path = _write_pseudo_case(
+        tmp_path,
+        "compile_xfail",
+        "this is not a valid dsl program !!!\n",
+        {
+            "description": "compile-stage xfail probe",
+            "category": "arith",
+            "oracle": "interpreter",
+            "expected_return": 0,
+            "xfail": {
+                "stages": ["compile"],
+                "reason": "probe: compile stage fails",
+                "owner": "tests",
+            },
+        },
+    )
+    spec = load_case_spec(dsl_path, tmp_path)
+    assert spec.meta_errors == (), spec.meta_errors
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "ALL_CASES", (spec,))
+    params = params_for(STAGE_COMPILE)
+    assert params and params[0].marks, "compile-stage xfail mark missing"
+    assert any(mark.name == "xfail" for mark in params[0].marks)
+    assert not params_for(None)[0].marks
+    runner = DSLSuiteRunner(roots=(tmp_path,))
+    try:
+        outcome = runner.run_case(spec)
+    finally:
+        runner.cleanup()
+    assert outcome.status == STATUS_XFAIL
+    assert outcome.error_stage == STAGE_COMPILE
+
+
+BRANCH_TARGET_XFAIL_CASES = frozenset({
+    "cases/009_maxpool",
+    "cases/013_for_sum",
+    "cases/014_for_dot",
+    "cases/015_for_relu",
+    "cases/016_if_simple",
+    "cases/017_while_sum",
+    "cases/018_nested_if",
+    "cases/019_nested_loop",
+    "cases/021_dsl_if_else",
+    "cases/022_dsl_while_sum",
+    "stress/reg_pressure_loop",
+})
+
+
+def test_branch_target_xfails_blame_linear_scan() -> None:
+    """F2 regression: assemble xfails must blame the linear-scan emitter."""
+    discovered = {case.case_id for case in ALL_CASES}
+    missing = BRANCH_TARGET_XFAIL_CASES - discovered
+    assert not missing, f"cases disappeared: {sorted(missing)}"
+    for case in ALL_CASES:
+        if case.case_id not in BRANCH_TARGET_XFAIL_CASES:
+            continue
+        assert case.xfail is not None
+        assert STAGE_ASSEMBLE in case.xfail.stages
+        assert case.xfail.owner == "backend/regalloc", case.case_id
+        assert "linear" in case.xfail.reason, case.case_id
+        assert "first bad line" in case.xfail.reason, case.case_id
+
+
+@pytest.mark.parametrize(
+    "case_id", ["cases/013_for_sum", "cases/016_if_simple"],
+)
+def test_greedy_allocator_encodes_branch_targets(case_id: str) -> None:
+    """F2 regression: same encoder encodes branch targets on greedy path."""
+    spec = next(case for case in ALL_CASES if case.case_id == case_id)
+    runner = DSLSuiteRunner(roots=(spec.root,), reg_alloc="greedy")
+    try:
+        compile_outcome = runner.compile_case(spec)
+        assert compile_outcome.ok, compile_outcome.error
+        assemble_outcome = runner.assemble_asm(compile_outcome.asm_text)
+        assert assemble_outcome.ok, assemble_outcome.error
+    finally:
+        runner.cleanup()
+
+
+def test_interpreter_blind_spot_reported_as_warning(
+    suite_runner: DSLSuiteRunner,
+) -> None:
+    """F3 regression: interpreter blind spots must surface in the report."""
+    spec = next(
+        case for case in ALL_CASES
+        if case.case_id == "cases/020_constant_propagation"
+    )
+    assert any("interpreter" in warning for warning in spec.warnings)
+    outcome = suite_runner.run_case(spec)
+    report = SuiteReport(
+        results=[outcome],
+        roots=("benchmarks/cases",),
+        compiler=suite_runner.compiler_info,
+        generated_at="test",
+        specs={spec.case_id: spec},
+    )
+    warnings = report.to_dict()["results"][0]["warnings"]
+    assert warnings, "interpreter blind spot warning missing from report"
+    assert any("interpreter" in warning for warning in warnings)
+
+
+def test_xpass_warning_is_printed(capsys: pytest.CaptureFixture) -> None:
+    """F8 regression: unexpected passes must produce a visible warning."""
+    result = CaseOutcome(
+        case_id="pseudo/xpass",
+        pytest_id="pseudo-xpass",
+        status=STATUS_XPASS,
+        compile=CompileOutcome(
+            ok=True, asm_text="", output_path=None,
+            ir_instruction_count=0, duration_s=0.0, error=None,
+        ),
+        assemble=None,
+        budget=None,
+        semantic=None,
+        error_stage=None,
+        error=None,
+        xfail=None,
+    )
+    report = SuiteReport(
+        results=[result], roots=("pseudo",), compiler={},
+        generated_at="test",
+    )
+    _print_summary(report, quiet=True)
+    captured = capsys.readouterr()
+    assert "xpass" in captured.err.lower()
