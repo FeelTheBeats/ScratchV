@@ -107,6 +107,14 @@ jobs:
         run: |
           python3.12 -m pytest tests/test_pr37_regression.py -v --tb=short
 
+      - name: Run topic07 logger regressions
+        run: |
+          python3.12 -m pytest \
+            tests/test_logger.py \
+            tests/test_logger_wiring.py \
+            tests/test_topic07_logger_case_report.py \
+            -v --tb=short
+
       - name: Generate test visualization page
         if: github.ref == 'refs/heads/main'
         run: |
@@ -217,6 +225,14 @@ jobs:
             benchmarks/cases/const_merge_feature.asm \
             --json benchmark_reports/const_merge_report.json \
             --markdown benchmark_reports/const_merge_report.md
+
+      # ── 3.1.2 课题07：结构化日志 case 报告（A/B 输出一致 + 失败路径） ──
+      - name: Topic 07 logger case report
+        run: |
+          mkdir -p benchmark_reports
+          python3.12 benchmarks/run_topic07_logger_case.py \
+            --json benchmark_reports/logger_report.json \
+            --markdown benchmark_reports/logger_report.md
 
       # ── 3.2 DSL 用例编译 + 模拟基准 ────────────────────────────────────
       - name: DSL case compilation benchmarks
@@ -362,6 +378,9 @@ jobs:
           fi
           if [ -f benchmark_reports/const_merge_report.md ]; then
             cat benchmark_reports/const_merge_report.md >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f benchmark_reports/logger_report.md ]; then
+            cat benchmark_reports/logger_report.md >> $GITHUB_STEP_SUMMARY
           fi
           echo "" >> $GITHUB_STEP_SUMMARY
           if [ -f benchmark_reports/github_summary.md ]; then
