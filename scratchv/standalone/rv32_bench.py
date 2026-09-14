@@ -722,6 +722,18 @@ def _unavailable_dynamic(*, reason: str, mem_size: int, timeout_s: float,
     }
 
 
+def _unavailable_output(elements: int, completion: str) -> dict:
+    """Output block for runs that produced no (or no complete) values."""
+    return {
+        "addr": OUTPUT_ADDR,
+        "elements": elements,
+        "raw_hex": None,
+        "q16_16": None,
+        "completion": completion,
+        "partial": completion != "halted",
+    }
+
+
 def _read_output(machine, addr: int, elements: int) -> dict:
     values = []
     if machine.available and elements > 0:
@@ -735,7 +747,7 @@ def _read_output(machine, addr: int, elements: int) -> dict:
         "addr": addr,
         "elements": elements,
         "raw_hex": raw_hex,
-        "q16_16": q16[0] if len(q16) == 1 else q16,
+        "q16_16": q16,
     }
 
 
@@ -773,10 +785,7 @@ def run_simulation(*, asm_path: str, binary_path: str, data_offset: int,
                 mem_size=mem_size, timeout_s=timeout_s, input_seed=input_seed,
                 input_elements=input_elements, halt_addr=halt_addr,
             ),
-            "output": {
-                "addr": OUTPUT_ADDR, "elements": output_elements,
-                "raw_hex": None, "q16_16": None,
-            },
+            "output": _unavailable_output(output_elements, "not_run"),
         }
     _install_tinyfive_compat(m, halt_addr)
 
@@ -789,10 +798,7 @@ def run_simulation(*, asm_path: str, binary_path: str, data_offset: int,
                 timeout_s=timeout_s, input_seed=input_seed,
                 input_elements=input_elements, halt_addr=halt_addr,
             ),
-            "output": {
-                "addr": OUTPUT_ADDR, "elements": output_elements,
-                "raw_hex": None, "q16_16": None,
-            },
+            "output": _unavailable_output(output_elements, "not_run"),
         }
 
     unsupported = check_mnemonics(code_words)
@@ -804,10 +810,7 @@ def run_simulation(*, asm_path: str, binary_path: str, data_offset: int,
         )
         return {
             "dynamic": dyn,
-            "output": {
-                "addr": OUTPUT_ADDR, "elements": output_elements,
-                "raw_hex": None, "q16_16": None,
-            },
+            "output": _unavailable_output(output_elements, "not_run"),
         }
 
     m.load_binary(code_words, origin=0)
@@ -906,13 +909,13 @@ def run_simulation(*, asm_path: str, binary_path: str, data_offset: int,
         dyn["last_error"] = m.last_error
         return {
             "dynamic": dyn,
-            "output": {
-                "addr": OUTPUT_ADDR, "elements": output_elements,
-                "raw_hex": None, "q16_16": None,
-            },
+            "output": _unavailable_output(output_elements, "error"),
         }
 
     ops = {key: int(perf.get(key, 0)) for key in OPS_KEYS}
+    output = _read_output(m, layout["output_addr"], output_elements)
+    output["completion"] = completion
+    output["partial"] = completion != "halted"
     return {
         "dynamic": {
             "source": "simulated",
@@ -935,7 +938,7 @@ def run_simulation(*, asm_path: str, binary_path: str, data_offset: int,
             "per_label_note": "tinyfive exe() exposes no per-PC trace",
             "last_error": m.last_error,
         },
-        "output": _read_output(m, layout["output_addr"], output_elements),
+        "output": output,
     }
 
 
@@ -1046,6 +1049,7 @@ def audit_provenance(report: dict) -> list[str]:
             violations.append(f"{side_name}.dynamic missing")
             continue
         source = dyn.get("source")
+        completion = dyn.get("completion")
         if source == "simulated":
             for key in ("simulator", "simulator_version", "executed",
                         "memory_size_bytes", "input_seed"):
@@ -1053,7 +1057,7 @@ def audit_provenance(report: dict) -> list[str]:
                     violations.append(
                         f"{side_name}.dynamic.{key} missing for simulated data"
                     )
-            if dyn.get("completion") not in ("halted", "budget_exhausted", "timeout"):
+            if completion not in ("halted", "budget_exhausted", "timeout"):
                 violations.append(
                     f"{side_name}.dynamic.completion invalid: "
                     f"{dyn.get('completion')!r}"
@@ -1067,12 +1071,26 @@ def audit_provenance(report: dict) -> list[str]:
                         violations.append(
                             f"{side_name}.dynamic.ops.{key} must be an int"
                         )
-            if dyn.get("completion") == "halted" and \
-                    dyn.get("limit") is not None and \
-                    dyn.get("executed") == dyn.get("limit"):
+                executed = dyn.get("executed")
+                if isinstance(ops.get("total"), int) and \
+                        isinstance(executed, int) and ops["total"] != executed:
+                    violations.append(
+                        f"{side_name}.dynamic: executed={executed} != "
+                        f"ops.total={ops['total']} (inconsistent counters)"
+                    )
+            limit = dyn.get("limit")
+            executed = dyn.get("executed")
+            if isinstance(limit, int) and isinstance(executed, int) and \
+                    executed > limit:
+                violations.append(
+                    f"{side_name}.dynamic: executed={executed} > "
+                    f"limit={limit} (budget overrun)"
+                )
+            if completion == "halted" and limit is not None and \
+                    executed == limit:
                 violations.append(
                     f"{side_name}.dynamic: halted but executed==limit=="
-                    f"{dyn.get('limit')} (unverified halt)"
+                    f"{limit} (unverified halt)"
                 )
         elif source == "unavailable":
             if not dyn.get("reason"):
@@ -1085,6 +1103,41 @@ def audit_provenance(report: dict) -> list[str]:
             violations.append(
                 f"{side_name}.dynamic.source invalid: {source!r}"
             )
+
+        out = side.get("output")
+        if out is None:
+            if side_name == "scratchv":
+                violations.append("scratchv.output missing")
+        elif not isinstance(out, dict):
+            violations.append(f"{side_name}.output must be a dict")
+        else:
+            partial = out.get("partial")
+            if not isinstance(partial, bool):
+                violations.append(f"{side_name}.output.partial must be a bool")
+            elif isinstance(completion, str) and \
+                    partial != (completion != "halted"):
+                violations.append(
+                    f"{side_name}.output.partial={partial} inconsistent with "
+                    f"dynamic.completion={completion!r}"
+                )
+            out_completion = out.get("completion")
+            if not isinstance(out_completion, str) or not out_completion:
+                violations.append(f"{side_name}.output.completion missing")
+            if partial is False and out.get("raw_hex") is None:
+                violations.append(
+                    f"{side_name}.output.raw_hex missing for a complete result"
+                )
+            q16 = out.get("q16_16")
+            if q16 is not None and not isinstance(q16, list):
+                violations.append(
+                    f"{side_name}.output.q16_16 must be a list or null"
+                )
+            elif isinstance(q16, list) and isinstance(out.get("elements"), int) \
+                    and len(q16) != out["elements"]:
+                violations.append(
+                    f"{side_name}.output.q16_16 has {len(q16)} elements, "
+                    f"expected {out['elements']}"
+                )
 
     comparison = report.get("comparison") or {}
     ratio = comparison.get("dynamic_instruction_ratio")
@@ -1229,20 +1282,41 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print("  [2/4] LLVM compilation (RV32IMF, float32)", file=sys.stderr)
         llvm_compile = compile_llvm_rv32(args.model, str(out / "_ll_rv32.s"))
+        if llvm_compile["status"] == "failed":
+            llvm_reason = (
+                "llvm compile failed: "
+                f"{llvm_compile.get('reason') or llvm_compile.get('error')}"
+            )
+        elif llvm_compile["status"] == "skipped":
+            llvm_reason = (
+                f"llvm compile skipped: {llvm_compile.get('reason')}"
+            )
+        elif llvm_compile.get("isa_mismatch"):
+            llvm_reason = (
+                f"llvm isa mismatch: {llvm_compile.get('reason')} "
+                "(dynamic comparison disabled)"
+            )
+        else:
+            llvm_reason = (
+                "llvm executable image pipeline not implemented "
+                "(topic 25 boundary)"
+            )
         llvm = {
             "compile": llvm_compile,
             "dynamic": {
                 "source": "unavailable",
                 "simulator": "tinyfive",
                 "completion": "not_run",
-                "reason": (
-                    "llvm executable image pipeline not implemented "
-                    "(topic 25 boundary)"
-                ),
+                "reason": llvm_reason,
                 "ops": None,
             },
         }
-        if llvm_compile["status"] == "skipped":
+        if llvm_compile["status"] == "failed":
+            warnings.append(
+                "LLVM compilation failed: "
+                f"{llvm_compile.get('reason') or llvm_compile.get('error')}"
+            )
+        elif llvm_compile["status"] == "skipped":
             warnings.append(
                 f"LLVM side skipped: {llvm_compile.get('reason')}"
             )
@@ -1251,6 +1325,14 @@ def main(argv: list[str] | None = None) -> int:
                 "LLVM assembly contains RV64-only mnemonics; dynamic "
                 "comparison disabled"
             )
+
+    if effective_limit == 0:
+        warnings.append(
+            "full simulation requested; no automatic instruction-count or "
+            "wall-clock estimate is available (use --max-instructions N to "
+            "calibrate); results are marked partial if the wall-clock "
+            "timeout fires"
+        )
 
     print("  [3/4] TinyFive simulation", file=sys.stderr)
     try:

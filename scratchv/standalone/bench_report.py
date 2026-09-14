@@ -532,9 +532,13 @@ def render_markdown(report: dict) -> str:
     lines.append(f"| code bytes | {_fmt(sv_compile.get('code_bytes'))} | — |")
     lines.append(f"| data offset | {_fmt(sv_compile.get('data_offset'))} | — |")
     lines.append(f"| data bytes | {_fmt(sv_compile.get('data_bytes'))} | — |")
+    ll_static = (
+        _fmt(ll_compile.get("static_insns"))
+        if ll_compile.get("status") == "success" else "—"
+    )
     lines.append(
         f"| static insns [asm_scan] | {_fmt(sv_compile.get('static_insns'))} "
-        f"| {_fmt(ll_compile.get('static_insns'))} |"
+        f"| {ll_static} |"
     )
     lines.append("")
     lines.append("### Static instruction mix [static]")
@@ -631,10 +635,17 @@ def render_markdown(report: dict) -> str:
         f"- static_source={_fmt(sv_compile.get('static_source'))} "
         f"| llvm static_source={_fmt(ll_compile.get('static_source'))}"
     )
+    if sv_dyn.get("source") != "simulated":
+        out_tag = "[unavailable]"
+    elif sv_out.get("partial"):
+        out_tag = "[measured/partial]"
+    else:
+        out_tag = "[measured]"
     lines.append(
-        f"- output: {_fmt(sv_out.get('raw_hex'))} "
+        f"- output {out_tag}: {_fmt(sv_out.get('raw_hex'))} "
         f"(addr=0x{int(sv_out.get('addr') or 0):x}, "
-        f"elements={_fmt(sv_out.get('elements'))})"
+        f"elements={_fmt(sv_out.get('elements'))}, "
+        f"completion={_fmt(sv_out.get('completion'))})"
     )
     return "\n".join(lines)
 
@@ -845,6 +856,46 @@ def validate_report_schema(report: dict) -> list[str]:
                 errors.append(
                     f"{side}.dynamic.ops must be null when unavailable"
                 )
+
+    out = _dig(report, "scratchv.output")
+    if out is _MISSING or not isinstance(out, dict):
+        errors.append("missing required field: scratchv.output")
+    else:
+        if not isinstance(out.get("partial"), bool):
+            errors.append(
+                f"invalid scratchv.output.partial: {out.get('partial')!r}"
+            )
+        if not isinstance(out.get("completion"), str) or \
+                not out.get("completion"):
+            errors.append(
+                "invalid scratchv.output.completion: "
+                f"{out.get('completion')!r}"
+            )
+        if not is_int(out.get("elements")):
+            errors.append(
+                f"invalid scratchv.output.elements: "
+                f"{out.get('elements')!r}"
+            )
+        q16 = out.get("q16_16")
+        if out.get("partial") is False:
+            if out.get("raw_hex") is None:
+                errors.append(
+                    "missing required field: scratchv.output.raw_hex"
+                )
+            if not isinstance(q16, list):
+                errors.append(
+                    f"invalid scratchv.output.q16_16: {q16!r}"
+                )
+        elif q16 is not None and not isinstance(q16, list):
+            errors.append(
+                f"invalid scratchv.output.q16_16: {q16!r}"
+            )
+        if isinstance(q16, list) and is_int(out.get("elements")) and \
+                len(q16) != out["elements"]:
+            errors.append(
+                f"invalid scratchv.output.q16_16 length: {len(q16)} "
+                f"!= elements {out['elements']}"
+            )
 
     comparison = _dig(report, "comparison")
     if comparison is _MISSING or not isinstance(comparison, dict):

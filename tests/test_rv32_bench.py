@@ -105,6 +105,7 @@ def _fake_scratchv(*, completion="halted", limit=None, executed=100,
         "output": {
             "addr": 201326592, "elements": 36,
             "raw_hex": "0x" + "00" * 144, "q16_16": [0.0] * 36,
+            "completion": completion, "partial": completion != "halted",
         },
     }
 
@@ -165,6 +166,13 @@ def test_full_run_small_model_matches_reference(tmp_path, mini_model,
     assert dyn["completion"] == "halted"
     assert dyn["executed"] > 0
     assert dyn["ops"]["total"] == dyn["executed"]
+    assert any(
+        "no automatic" in w for w in report["warnings"]
+    ), report["warnings"]
+    out_block = report["scratchv"]["output"]
+    assert out_block["completion"] == "halted"
+    assert out_block["partial"] is False
+    assert isinstance(out_block["q16_16"], list)
     assert rv32_bench.audit_provenance(report) == []
     assert bench_report.validate_report_schema(report) == []
 
@@ -231,17 +239,65 @@ def test_budget_exhausted_is_labeled(tmp_path, mini_model):
     assert dyn["ops"]["total"] == 1000
     assert report["comparison"]["dynamic_instruction_ratio"] is None
     assert "budget_exhausted" in report["comparison"]["incomparable_reason"]
+    out_block = report["scratchv"]["output"]
+    assert out_block["completion"] == "budget_exhausted"
+    assert out_block["partial"] is True
+    assert isinstance(out_block["q16_16"], list)
     assert rv32_bench.audit_provenance(report) == []
     assert bench_report.validate_report_schema(report) == []
 
     markdown = (out / "rv32_bench.md").read_text()
     assert "[measured/budget]" in markdown
+    assert "[measured/partial]" in markdown
     assert "dynamic instruction ratio" not in markdown
 
     rc_strict = rv32_bench.main([
         str(mini_model), "--max-instructions", "1000", "--quiet",
         "--fail-on-incomplete", "--output-dir", str(tmp_path / "budget2"),
         "--timeout", "120", "--chunk-instructions", "4096",
+    ])
+    assert rc_strict == rv32_bench.EXIT_INCOMPLETE
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# T2b: wall-clock timeout keeps partial counters and partial output
+# ───────────────────────────────────────────────────────────────────────────
+
+def test_wall_clock_timeout_is_labeled_partial(tmp_path, mini_model):
+    pytest.importorskip("tinyfive")
+    out = tmp_path / "timeout"
+    rc = rv32_bench.main([
+        str(mini_model), "--quiet", "--output-dir", str(out),
+        "--timeout", "0.05", "--chunk-instructions", "4096",
+    ])
+    assert rc == rv32_bench.EXIT_OK
+
+    report = json.loads((out / "rv32_bench.json").read_text())
+    dyn = report["scratchv"]["dynamic"]
+    assert dyn["source"] == "simulated"
+    assert dyn["completion"] == "timeout"
+    assert dyn["limit"] is None
+    assert dyn["executed"] > 0
+    assert dyn["ops"]["total"] == dyn["executed"]
+    assert report["comparison"]["dynamic_instruction_ratio"] is None
+    assert "timeout" in report["comparison"]["incomparable_reason"]
+    assert any("timeout" in w for w in report["warnings"])
+
+    out_block = report["scratchv"]["output"]
+    assert out_block["completion"] == "timeout"
+    assert out_block["partial"] is True
+    assert isinstance(out_block["q16_16"], list)
+    assert rv32_bench.audit_provenance(report) == []
+    assert bench_report.validate_report_schema(report) == []
+
+    markdown = (out / "rv32_bench.md").read_text()
+    assert "[measured/timeout]" in markdown
+    assert "[measured/partial]" in markdown
+
+    rc_strict = rv32_bench.main([
+        str(mini_model), "--quiet", "--fail-on-incomplete",
+        "--output-dir", str(tmp_path / "timeout_strict"),
+        "--timeout", "0.05", "--chunk-instructions", "4096",
     ])
     assert rc_strict == rv32_bench.EXIT_INCOMPLETE
 
@@ -277,6 +333,11 @@ def test_report_requires_provenance(tmp_path, mini_model, monkeypatch):
     assert report["scratchv"]["compile"]["static_insns"] > 0
     assert report["scratchv"]["compile"]["static_source"] == "asm_scan"
     assert report["comparison"]["dynamic_instruction_ratio"] is None
+    out_block = report["scratchv"]["output"]
+    assert out_block["completion"] == "not_run"
+    assert out_block["partial"] is True
+    assert out_block["raw_hex"] is None
+    assert out_block["q16_16"] is None
     assert rv32_bench.audit_provenance(report) == []
     assert bench_report.validate_report_schema(report) == []
 
@@ -373,6 +434,47 @@ def test_llvm_riscv64_flagged_isa_mismatch():
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# T6b: a failed LLVM compile is surfaced, not silently swallowed
+# ───────────────────────────────────────────────────────────────────────────
+
+def test_llvm_compile_failure_is_surfaced(tmp_path, mini_model, monkeypatch):
+    failure_reason = "RuntimeError: no rv32 target available"
+
+    def _failed(*_args, **_kwargs):
+        return {
+            "status": "failed", "reason": failure_reason,
+            "isa_detected": None, "isa_mismatch": False,
+            "static_insns": 0, "static_source": "asm_scan", "elapsed_s": 0.0,
+        }
+
+    monkeypatch.setattr(rv32_bench, "compile_llvm_rv32", _failed)
+    out = tmp_path / "llvmfail"
+    rc = rv32_bench.main([
+        str(mini_model), "--quiet", "--output-dir", str(out),
+        "--max-instructions", "500", "--timeout", "60",
+        "--chunk-instructions", "4096",
+    ])
+    assert rc == rv32_bench.EXIT_OK
+
+    report = json.loads((out / "rv32_bench.json").read_text())
+    assert report["llvm"]["compile"]["status"] == "failed"
+    assert any(
+        "LLVM compilation failed" in w and failure_reason in w
+        for w in report["warnings"]
+    ), report["warnings"]
+    assert failure_reason in report["llvm"]["dynamic"]["reason"]
+    assert report["errors"] == []
+
+    markdown = (out / "rv32_bench.md").read_text()
+    assert failure_reason in markdown
+    row = next(
+        line for line in markdown.splitlines()
+        if line.startswith("| static insns [asm_scan] |")
+    )
+    assert row.rstrip().endswith("| — |")
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # T7: the provenance audit rejects static counts masquerading as dynamic
 # ───────────────────────────────────────────────────────────────────────────
 
@@ -401,10 +503,15 @@ def test_audit_provenance_rejects_static_fallback():
             "ops": {"total": 1000, "load": 0, "store": 0, "mul": 0,
                     "add": 0, "madd": 0, "branch": 0},
         }
+    ratio_from_truncated["scratchv"]["output"] = {
+        "addr": 201326592, "elements": 36, "raw_hex": None,
+        "q16_16": None, "completion": "budget_exhausted", "partial": True,
+    }
     ratio_from_truncated["comparison"] = {
         "dynamic_instruction_ratio": 0.31, "incomparable_reason": None,
     }
-    assert rv32_bench.audit_provenance(ratio_from_truncated)
+    ratio_violations = rv32_bench.audit_provenance(ratio_from_truncated)
+    assert any("incomplete/non-simulated" in v for v in ratio_violations)
 
     forged_halt = deepcopy(clean)
     forged_halt["scratchv"]["dynamic"].update(
@@ -417,6 +524,59 @@ def test_audit_provenance_rejects_static_fallback():
         "unverified halt" in v
         for v in rv32_bench.audit_provenance(forged_halt)
     )
+
+    counters_disagree = deepcopy(clean)
+    counters_disagree["scratchv"]["dynamic"].update(
+        {"executed": 100, "ops": {
+            "total": 9999, "load": 0, "store": 0, "mul": 0,
+            "add": 0, "madd": 0, "branch": 0,
+        }},
+    )
+    assert any(
+        "ops.total" in v
+        for v in rv32_bench.audit_provenance(counters_disagree)
+    )
+
+    budget_overrun = deepcopy(clean)
+    budget_overrun["scratchv"]["dynamic"].update(
+        {"completion": "halted", "limit": 50, "executed": 100, "ops": {
+            "total": 100, "load": 0, "store": 0, "mul": 0,
+            "add": 0, "madd": 0, "branch": 0,
+        }},
+    )
+    assert any(
+        "budget overrun" in v
+        for v in rv32_bench.audit_provenance(budget_overrun)
+    )
+
+    unmasked_output = deepcopy(clean)
+    unmasked_output["scratchv"]["dynamic"]["completion"] = "timeout"
+    assert any(
+        "output.partial" in v
+        for v in rv32_bench.audit_provenance(unmasked_output)
+    )
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# T7b: output.q16_16 has one stable type (list) regardless of element count
+# ───────────────────────────────────────────────────────────────────────────
+
+def test_output_q16_16_is_always_a_list():
+    class _StubMachine:
+        available = True
+
+        def __init__(self, words):
+            self.words = words
+
+        def read_mem_i32(self, addr):
+            return self.words[addr // 4]
+
+    single = rv32_bench._read_output(_StubMachine([-65536]), 0, 1)
+    assert isinstance(single["q16_16"], list)
+    assert single["q16_16"] == [-1.0]
+
+    pair = rv32_bench._read_output(_StubMachine([65536, -131072]), 0, 2)
+    assert pair["q16_16"] == [1.0, -2.0]
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -431,8 +591,8 @@ def test_bench_report_schema_required_keys():
     joined = "\n".join(empty_errors)
     for key in (
         "schema_version", "model.sha256", "environment", "targets",
-        "scratchv.compile", "scratchv.dynamic", "llvm.compile",
-        "llvm.dynamic", "comparison",
+        "scratchv.compile", "scratchv.dynamic", "scratchv.output",
+        "llvm.compile", "llvm.dynamic", "comparison",
     ):
         assert key in joined, f"{key} missing from {empty_errors}"
 
@@ -455,4 +615,11 @@ def test_bench_report_schema_required_keys():
     assert any(
         "comparison.incomparable_reason" in e
         for e in bench_report.validate_report_schema(bad_ratio)
+    )
+
+    no_output_partial = deepcopy(report)
+    del no_output_partial["scratchv"]["output"]["partial"]
+    assert any(
+        "scratchv.output.partial" in e
+        for e in bench_report.validate_report_schema(no_output_partial)
     )
