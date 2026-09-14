@@ -46,6 +46,13 @@ ALL_STAGES: tuple[str, ...] = (
     STAGE_SEMANTIC,
 )
 
+_STAGE_RESULT_KEYS: dict[str, str] = {
+    STAGE_COMPILE: "compile_ok",
+    STAGE_ASSEMBLE: "asm_encodable",
+    STAGE_BUDGET: "inst_budget_ok",
+    STAGE_SEMANTIC: "semantic_ok",
+}
+
 ASSERT_COMPILE_OK: str = "compile_ok"
 ASSERT_ASM_ENCODABLE: str = "asm_encodable"
 ASSERT_INST_BUDGET: str = "inst_budget"
@@ -256,6 +263,68 @@ class SuiteReport:
             "skipped": self.skip_count,
         }
 
+    def stage_summary(self) -> dict[str, dict[str, int]]:
+        """Per-stage verdict aggregation with xfail attribution.
+
+        ``passed`` counts true verdicts not excused by an unexpected pass,
+        ``xfail`` counts failures excused for that stage by the case's
+        declaration, ``failed`` counts unexcused failures, ``xpass`` counts
+        declared stages of a case that unexpectedly passed, and ``blocked``
+        counts stages that never executed (skipped case, earlier failure, or
+        the assertion was disabled).
+        """
+        counts: dict[str, dict[str, int]] = {
+            stage: {
+                "passed": 0, "xfail": 0, "failed": 0,
+                "xpass": 0, "blocked": 0,
+            }
+            for stage in ALL_STAGES
+        }
+        for r in self.results:
+            declared = set(r.xfail.stages) if r.xfail else set()
+            stages = _stage_map(r)
+            for stage, key in _STAGE_RESULT_KEYS.items():
+                bucket = counts[stage]
+                verdict = stages[key]
+                declared_here = stage in declared
+                if verdict is None:
+                    bucket["blocked"] += 1
+                elif verdict is False:
+                    if declared_here and r.status == STATUS_XFAIL:
+                        bucket["xfail"] += 1
+                    else:
+                        bucket["failed"] += 1
+                elif declared_here and r.status == STATUS_XPASS:
+                    bucket["xpass"] += 1
+                else:
+                    bucket["passed"] += 1
+        return counts
+
+    def owner_summary(self) -> dict[str, dict[str, int]]:
+        """Per-owner xfail ledger, sorted by owner for stable output."""
+        owners: dict[str, dict[str, int]] = {}
+        for r in self.results:
+            if r.xfail is None:
+                continue
+            bucket = owners.setdefault(
+                r.xfail.owner,
+                {"declared": 0, "xfailed": 0, "xpassed": 0, "failed": 0},
+            )
+            bucket["declared"] += 1
+            if r.status == STATUS_XFAIL:
+                bucket["xfailed"] += 1
+            elif r.status == STATUS_XPASS:
+                bucket["xpassed"] += 1
+            elif r.status == STATUS_FAIL:
+                bucket["failed"] += 1
+        return dict(sorted(owners.items()))
+
+    def xpassed_cases(self) -> list[str]:
+        """Case ids whose declared xfail stages unexpectedly passed."""
+        return sorted(
+            r.case_id for r in self.results if r.status == STATUS_XPASS
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": SCHEMA_VERSION,
@@ -264,6 +333,9 @@ class SuiteReport:
             "roots": list(self.roots),
             "compiler": dict(self.compiler),
             "summary": self.summary(),
+            "stage_summary": self.stage_summary(),
+            "owner_summary": self.owner_summary(),
+            "xpassed_cases": self.xpassed_cases(),
             "results": [self._result_to_dict(r) for r in self.results],
         }
 
@@ -288,6 +360,45 @@ class SuiteReport:
             "|-------|--------|---------|---------|--------|---------|",
             "| {total} | {passed} | {xfailed} | {xpassed} | {failed} | "
             "{skipped} |".format(**summary),
+        ]
+        if summary["xpassed"]:
+            lines += [
+                "",
+                f"**WARNING: {summary['xpassed']} unexpected pass(es) "
+                "(xpass)** — declared xfail stages now pass; remove the "
+                "obsolete declaration or run with `--strict-xfail`.",
+            ]
+        lines += [
+            "",
+            "## Stage summary",
+            "",
+            "| stage | passed | xfail | failed | xpass | blocked |",
+            "|-------|--------|-------|--------|-------|---------|",
+        ]
+        for stage, counts in self.stage_summary().items():
+            lines.append(
+                f"| {stage} | {counts['passed']} | {counts['xfail']} | "
+                f"{counts['failed']} | {counts['xpass']} | "
+                f"{counts['blocked']} |"
+            )
+        owners = self.owner_summary()
+        lines += [
+            "",
+            "## Owner summary",
+            "",
+            "| owner | declared | xfailed | xpassed | failed |",
+            "|-------|----------|---------|---------|--------|",
+        ]
+        if owners:
+            for owner, counts in owners.items():
+                lines.append(
+                    f"| {owner} | {counts['declared']} | "
+                    f"{counts['xfailed']} | {counts['xpassed']} | "
+                    f"{counts['failed']} |"
+                )
+        else:
+            lines.append("| - | - | - | - | - |")
+        lines += [
             "",
             "## Cases",
             "",
@@ -326,18 +437,28 @@ class SuiteReport:
         else:
             lines.append("No hard failures.")
 
-        blocked_or_xfail = [
-            r for r in self.results
-            if r.status in (STATUS_XFAIL, STATUS_XPASS)
+        xpassed = [r for r in self.results if r.status == STATUS_XPASS]
+        expected_failures = [
+            r for r in self.results if r.status == STATUS_XFAIL
         ]
-        lines += ["", "## Expected failures / unexpected passes", ""]
-        if blocked_or_xfail:
-            for r in blocked_or_xfail:
-                which = (
-                    r.error_stage if r.status == STATUS_XFAIL
-                    else "declared stages now pass"
+        lines += ["", "## Unexpected passes (xpass — action required)", ""]
+        if xpassed:
+            for result in xpassed:
+                stages = (
+                    ", ".join(result.xfail.stages) if result.xfail else "-"
                 )
-                lines.append(f"- {r.case_id} [{r.status}] ({which})")
+                owner = result.xfail.owner if result.xfail else "-"
+                lines.append(
+                    f"- **{result.case_id}**: declared stages now pass "
+                    f"(owner={owner}, stages={stages})"
+                )
+        else:
+            lines.append("None.")
+        lines += ["", "## Expected failures (xfail)", ""]
+        if expected_failures:
+            for result in expected_failures:
+                which = result.error_stage or "unknown"
+                lines.append(f"- {result.case_id} ({which})")
         else:
             lines.append("None.")
 
@@ -399,15 +520,7 @@ class SuiteReport:
             "flow": spec.flow if spec else "unknown",
             "oracle": spec.oracle if spec else "unknown",
             "status": r.status,
-            "stages": {
-                "compile_ok": None if skipped else r.compile.ok,
-                "asm_encodable": None if skipped or r.assemble is None
-                else r.assemble.ok,
-                "inst_budget_ok": None if skipped or r.budget is None
-                else r.budget.ok,
-                "semantic_ok": None if skipped or r.semantic is None
-                else r.semantic.ok,
-            },
+            "stages": _stage_map(r),
             "metrics": {
                 "ir_instructions": None if skipped
                 else r.compile.ir_instruction_count,
@@ -431,6 +544,24 @@ def _mark(value: bool | None) -> str:
     if value is None:
         return "-"
     return "ok" if value else "FAIL"
+
+
+def _stage_map(r: CaseOutcome) -> dict[str, bool | None]:
+    """Per-stage verdicts with the report's ``null`` semantics.
+
+    Skipped cases expose ``None`` for every stage so that the JSON schema and
+    the aggregate summaries agree on what "did not execute" means.
+    """
+    skipped = r.status == STATUS_SKIP
+    return {
+        "compile_ok": None if skipped else r.compile.ok,
+        "asm_encodable": None if skipped or r.assemble is None
+        else r.assemble.ok,
+        "inst_budget_ok": None if skipped or r.budget is None
+        else r.budget.ok,
+        "semantic_ok": None if skipped or r.semantic is None
+        else r.semantic.ok,
+    }
 
 
 def _xfail_to_dict(spec: XFailSpec | None) -> dict[str, Any] | None:
