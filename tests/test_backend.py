@@ -194,8 +194,10 @@ class TestVectorDriverIntegration:
             vectorize=True, vector_width=2, reg_alloc="greedy"))
         program = _vector_ir()
         monkeypatch.setattr(driver, "_parse", lambda *a, **k: program)
+        source = tmp_path / "input.dsl"
+        source.write_text("x = add(a, b)\n", encoding="utf-8")
 
-        result = driver.compile("input.dsl", str(tmp_path / "out.s"))
+        result = driver.compile(str(source), str(tmp_path / "out.s"))
 
         assert result.success
         assert "vectorized 1/1 loop(s), width=2" in result.stats["opt_message"]
@@ -207,8 +209,10 @@ class TestVectorDriverIntegration:
         driver = CompilerDriver(CompilerConfig(
             vectorize=True, vector_isa="v", reg_alloc="greedy"))
         monkeypatch.setattr(driver, "_parse", lambda *a, **k: _vector_ir())
+        source = tmp_path / "input.dsl"
+        source.write_text("x = add(a, b)\n", encoding="utf-8")
 
-        result = driver.compile("input.dsl", str(tmp_path / "out.s"))
+        result = driver.compile(str(source), str(tmp_path / "out.s"))
 
         assert result.success is False
         assert any("phase 2" in err for err in result.errors)
@@ -217,7 +221,9 @@ class TestVectorDriverIntegration:
         config = CompilerConfig(vectorize=False, reg_alloc="greedy")
         driver = CompilerDriver(config)
         monkeypatch.setattr(driver, "_parse", lambda *a, **k: _vector_ir())
-        result = driver.compile("input.dsl", str(tmp_path / "out.s"))
+        source = tmp_path / "input.dsl"
+        source.write_text("x = add(a, b)\n", encoding="utf-8")
+        result = driver.compile(str(source), str(tmp_path / "out.s"))
 
         assert result.success
         assert result.stats["opt_message"] == ""
