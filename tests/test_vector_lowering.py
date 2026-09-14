@@ -60,6 +60,28 @@ def _make_relu_loop(n: int):
     return b.program
 
 
+def _make_inplace_relu_loop(n: int):
+    """a[i] = relu(a[i]); a separate address ADD per access (F1 N<B).
+
+    The vector rewrite deduplicates the two ADD instructions, so the new
+    body is shorter than the original and the pre-fix remainder insertion
+    landed after the trailing ``return`` (dead code, review F1).
+    """
+    b = IRBuilder()
+    b.new_function("main")
+    b.new_block("entry")
+    a = b.load_const(BASE_A, dtype=DataType.INT32)
+    iv = b.for_loop(0, n)
+    c4 = b.load_const(4, dtype=DataType.INT32)
+    off = b.mul(iv, c4)
+    va = b.load(b.add(a, off))
+    r = b.relu(va)
+    b.store(b.add(a, off), r)
+    b.endfor()
+    b.ret()
+    return b.program
+
+
 def _make_mul_loop(n: int):
     b = IRBuilder()
     b.new_function("main")
@@ -105,7 +127,8 @@ def _compile(program):
     return machine, asm, assemble_to_binary(asm)
 
 
-def _compile_and_run(program, n, inputs_a, inputs_b=None):
+def _compile_and_run(program, n, inputs_a, inputs_b=None,
+                     out_base: int = BASE_OUT):
     _, asm, binary = _compile(program)
     emu = RV32Emulator()
     emu.load_code(bytes(binary))
@@ -115,7 +138,7 @@ def _compile_and_run(program, n, inputs_a, inputs_b=None):
         for i, x in enumerate(inputs_b):
             emu.write_i32(BASE_B + 4 * i, int(x))
     emu.run(max_instr=200000)
-    return asm, [emu.read_i32(BASE_OUT + 4 * i) for i in range(n)]
+    return asm, [emu.read_i32(out_base + 4 * i) for i in range(n)]
 
 
 # ── Sanity: no vector instructions in the lowered output ────────────────
@@ -161,24 +184,68 @@ class TestLoweringSanity:
 
 # ── Executable differential ─────────────────────────────────────────────
 
+_EXECUTABLE_MATRIX = [
+    pytest.param(w, n, pattern, id=f"w{w}-n{n}-{pattern}")
+    for w in (2, 4)
+    for n in (16, 17)
+    for pattern in ("map", "broadcast", "inplace")
+    # W=4 with a remainder needs more than the greedy allocator's 19
+    # virtual registers for map/broadcast; the pre-existing allocator
+    # spills without reloading there (review section 4, out of scope).
+    # Those two cells are covered structurally in tests/test_vectorize.py.
+    if (w, n, pattern) not in ((4, 17, "map"), (4, 17, "broadcast"))
+]
+
+
 class TestEmulatorDifferential:
     A_NEG = [7, -3, 0, 100000, -1, 2, -2048, 2047,
              123456, -654321, 0, -5, 9, -9, 42, -42]
     B_NEG = [3, 5, -7, 3, -8, -2, 15, 16,
              2, 11, 0, -12, 13, 13, -3, 4]
 
-    def _run_pair(self, make, n, width, inputs_a, inputs_b, reference):
+    def _run_pair(self, make, n, width, inputs_a, inputs_b, reference,
+                  out_base: int = BASE_OUT):
         baseline = make(n)
-        _, out_scalar = _compile_and_run(baseline, n, inputs_a, inputs_b)
+        _, out_scalar = _compile_and_run(baseline, n, inputs_a, inputs_b,
+                                         out_base)
 
         vectorized = make(n)
         result = Vectorizer(vectorized, width=width).run(vectorized)
         assert result.changes == 1
-        _, out_vector = _compile_and_run(vectorized, n, inputs_a, inputs_b)
+        _, out_vector = _compile_and_run(vectorized, n, inputs_a, inputs_b,
+                                         out_base)
 
         assert out_scalar == reference
         assert out_vector == out_scalar
         assert out_vector == reference
+
+    @pytest.mark.parametrize("width,n,pattern", _EXECUTABLE_MATRIX)
+    def test_matrix_matches_scalar(self, width, n, pattern):
+        inputs = (self.A_NEG + [11])[:n]
+        if pattern == "broadcast":
+            inputs = [abs(x) for x in inputs]
+            self._run_pair(_make_div_loop, n, width, inputs, None,
+                           [x // 3 for x in inputs])
+        elif pattern == "inplace":
+            self._run_pair(_make_inplace_relu_loop, n, width, inputs, None,
+                           [max(x, 0) for x in inputs], out_base=BASE_A)
+        else:
+            self._run_pair(_make_relu_loop, n, width, inputs, None,
+                           [max(x, 0) for x in inputs])
+
+    def test_inplace_remainder_w2_matches_scalar(self):
+        """Review F1 repro: in-place relu, n=17, W=2 → a[16] must be 0."""
+        inputs = self.A_NEG + [-9]
+        reference = [max(x, 0) for x in inputs]
+        assert len(reference) == 17 and reference[16] == 0
+        self._run_pair(_make_inplace_relu_loop, 17, 2, inputs, None,
+                       reference, out_base=BASE_A)
+
+    def test_div_two_base_remainder_w2_matches_scalar(self):
+        """Review F1 repro: two address chains, n=17, W=2 (N>B insertion)."""
+        inputs = [abs(x) + 1 for x in (self.A_NEG + [11])]
+        reference = [x // 3 for x in inputs]
+        self._run_pair(_make_div_loop, 17, 2, inputs, None, reference)
 
     def test_relu_map_w4_matches_scalar(self):
         reference = [max(x, 0) for x in self.A_NEG]

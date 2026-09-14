@@ -4,6 +4,10 @@ Covers the vector builder APIs, the strip-mining decision tree
 (C1-C7 of the design document) and the structured rejection report.
 """
 
+from __future__ import annotations
+
+import pytest
+
 from scratchv.ir.builder import IRBuilder
 from scratchv.ir.types import DataType, Instruction, OpCode, Program
 from scratchv.optimizer.vectorize import (
@@ -12,6 +16,7 @@ from scratchv.optimizer.vectorize import (
     REASON_NO_ELEMENT_PATTERN,
     REASON_NON_CONSTANT_BOUNDS,
     REASON_NON_ELEMENTWISE_IV,
+    REASON_REGION_VALUE_ESCAPES,
     REASON_TRIP_TOO_SMALL,
     REASON_UNSUPPORTED_START,
     REASON_UNSUPPORTED_STEP,
@@ -77,6 +82,51 @@ def _make_chain_loop(n: int) -> Program:
     return b.program
 
 
+def _make_inplace_relu_loop(n: int) -> Program:
+    """a[i] = relu(a[i]) with a separate address ADD per access.
+
+    The vector rewrite deduplicates the two ``ADD`` instructions into one
+    (same base), so the rewritten body is *shorter* than the original
+    body: the F1 N < B case.
+    """
+    b = IRBuilder()
+    b.new_function("main")
+    b.new_block("entry")
+    a = b.load_const(0x400000, dtype=DataType.INT32)
+    iv = b.for_loop(0, n)
+    c4 = b.load_const(4, dtype=DataType.INT32)
+    off = b.mul(iv, c4)
+    va = b.load(b.add(a, off))
+    r = b.relu(va)
+    b.store(b.add(a, off), r)
+    b.endfor()
+    b.ret()
+    return b.program
+
+
+def _make_div_two_base_loop(n: int) -> Program:
+    """out[i] = a[i] / k with both input and output element chains.
+
+    The rewritten body gains a ``VBCAST``, so it is *longer* than the
+    original body: the F1 N > B case.
+    """
+    b = IRBuilder()
+    b.new_function("main")
+    b.new_block("entry")
+    a = b.load_const(0x400000, dtype=DataType.INT32)
+    o = b.load_const(0x420000, dtype=DataType.INT32)
+    k = b.load_const(3, dtype=DataType.INT32)
+    iv = b.for_loop(0, n)
+    c4 = b.load_const(4, dtype=DataType.INT32)
+    off = b.mul(iv, c4)
+    va = b.load(b.add(a, off))
+    r = b.div(va, k)
+    b.store(b.add(o, off), r)
+    b.endfor()
+    b.ret()
+    return b.program
+
+
 def _instructions(program: Program) -> list[Instruction]:
     return program.functions[0].blocks[0].instructions
 
@@ -98,6 +148,19 @@ def _body(program: Program, for_index: int) -> list[Instruction]:
 
 def _find(instrs: list[Instruction], opcode: OpCode) -> list[Instruction]:
     return [instr for instr in instrs if instr.opcode is opcode]
+
+
+def _matching_endfor(instrs: list[Instruction], for_index: int) -> int:
+    depth = 0
+    for j in range(for_index, len(instrs)):
+        op = instrs[j].opcode
+        if op is OpCode.FOR:
+            depth += 1
+        elif op is OpCode.ENDFOR:
+            depth -= 1
+            if depth == 0:
+                return j
+    raise AssertionError("FOR without matching ENDFOR")
 
 
 # ── Builder API ─────────────────────────────────────────────────────────
@@ -267,6 +330,91 @@ class TestVectorizerStructure:
         assert vec.last_report[0].status == "rejected"
         assert vec.last_report[0].reason == REASON_TRIP_TOO_SMALL
 
+    def test_consecutive_remainder_loops_both_vectorized(self):
+        """After a rewritten region the scan must resume past its remainder.
+
+        Guards ``_skip_rewritten``: a stale index would re-enter the
+        remainder loop of the first region and/or skip the second one.
+        """
+        b = IRBuilder()
+        b.new_function("main")
+        b.new_block("entry")
+        a = b.load_const(0x400000, dtype=DataType.INT32)
+        for _ in range(2):
+            iv = b.for_loop(0, 17)
+            c4 = b.load_const(4, dtype=DataType.INT32)
+            off = b.mul(iv, c4)
+            va = b.load(b.add(a, off))
+            r = b.relu(va)
+            b.store(b.add(a, off), r)
+            b.endfor()
+        b.ret()
+
+        vec = Vectorizer(b.program, width=2)
+        result = vec.run(b.program)
+
+        assert result.changes == 2
+        assert [rec.status for rec in vec.last_report] == [
+            "vectorized", "vectorized"]
+        assert len(_for_indices(b.program)) == 4
+
+
+# ── Remainder loop placement (review F1) ────────────────────────────────
+#
+# The remainder block must be inserted *after* the rewritten strip ENDFOR
+# (its position shifts with the length of the new body) and before the
+# trailing `return`.  The original bug inserted it at the stale pre-rewrite
+# index: a longer vector body nested the remainder inside the strip loop,
+# a shorter one left it after `return` as dead code.
+
+class TestRemainderPlacement:
+    @pytest.mark.parametrize("width", [2, 4])
+    @pytest.mark.parametrize(
+        "builder, relation",
+        [
+            pytest.param(_make_inplace_relu_loop, "N<B",
+                         id="shorter-vector-body"),
+            pytest.param(_make_div_two_base_loop, "N>B",
+                         id="longer-vector-body"),
+        ],
+    )
+    def test_remainder_is_sibling_after_strip_loop(self, builder, relation,
+                                                   width):
+        n = 17
+        program = builder(n)
+        vec = Vectorizer(program, width=width)
+        result = vec.run(program)
+
+        assert result.changes == 1
+        instrs = _instructions(program)
+        for_indices = _for_indices(program)
+        assert len(for_indices) == 2
+
+        strip_for, rem_for = for_indices
+        strip_endfor = _matching_endfor(instrs, strip_for)
+
+        # The strip loop must not contain the remainder FOR (no nesting).
+        assert not any(instr.opcode is OpCode.FOR
+                       for instr in instrs[strip_for + 1:strip_endfor])
+        # The remainder FOR is the immediate sibling of the strip ENDFOR.
+        assert rem_for == strip_endfor + 1
+
+        strips = n // width
+        assert instrs[rem_for].attrs == {
+            "start": strips * width, "end": n, "step": 1}
+        rem_endfor = _matching_endfor(instrs, rem_for)
+        # The remainder loop is before the trailing `return`, never dead.
+        assert rem_endfor < len(instrs) - 1
+        assert instrs[-1].opcode is OpCode.RETURN
+        assert not any(instr.opcode is OpCode.RETURN
+                       for instr in instrs[:rem_endfor])
+
+        remainder_body = _body(program, rem_for)
+        assert remainder_body
+        assert not any(instr.opcode.is_vector() for instr in remainder_body)
+        assert all(instr.dest.name.endswith("__rem")
+                   for instr in remainder_body if instr.dest)
+
 
 # ── Rejections (design doc 2.5 I1-I4) ───────────────────────────────────
 
@@ -321,6 +469,85 @@ class TestVectorizerRejects:
         b.endfor()
         b.ret()
         assert self._reject_reason(b.program) == REASON_ALIASING_STORE
+
+    @pytest.mark.parametrize("n", [16, 17])
+    def test_iv_live_out_rejected(self, n):
+        """Review F2: the original IV is redefined as the strip index."""
+        b = IRBuilder()
+        b.new_function("main")
+        b.new_block("entry")
+        a = b.load_const(0x400000, dtype=DataType.INT32)
+        o = b.load_const(0x420000, dtype=DataType.INT32)
+        iv = b.for_loop(0, n)
+        c4 = b.load_const(4, dtype=DataType.INT32)
+        off = b.mul(iv, c4)
+        va = b.load(b.add(a, off))
+        b.store(b.add(o, off), va)
+        b.endfor()
+        c4b = b.load_const(4, dtype=DataType.INT32)
+        b.store(b.add(o, c4b), iv)  # IV used after ENDFOR
+        b.ret()
+        assert self._reject_reason(b.program) == REASON_REGION_VALUE_ESCAPES
+
+    def test_region_local_value_live_out_rejected(self):
+        """Review F2: a region-local LOAD result escapes the region."""
+        b = IRBuilder()
+        b.new_function("main")
+        b.new_block("entry")
+        a = b.load_const(0x400000, dtype=DataType.INT32)
+        o = b.load_const(0x420000, dtype=DataType.INT32)
+        iv = b.for_loop(0, 16)
+        c4 = b.load_const(4, dtype=DataType.INT32)
+        off = b.mul(iv, c4)
+        va = b.load(b.add(a, off))
+        r = b.relu(va)
+        b.store(b.add(o, off), r)
+        b.endfor()
+        c4b = b.load_const(4, dtype=DataType.INT32)
+        b.store(b.add(o, c4b), va)  # region-local LOAD result live-out
+        b.ret()
+        assert self._reject_reason(b.program) == REASON_REGION_VALUE_ESCAPES
+
+    def test_cross_base_overlapping_rejected(self):
+        """Review F3: different base names may still overlap in memory."""
+        b = IRBuilder()
+        b.new_function("main")
+        b.new_block("entry")
+        out = b.load_const(0x420000, dtype=DataType.INT32)
+        c4 = b.load_const(4, dtype=DataType.INT32)
+        src = b.sub(out, c4)  # element-wise alias: src[i] == out[i - 1]
+        iv = b.for_loop(0, 16)
+        c4b = b.load_const(4, dtype=DataType.INT32)
+        off = b.mul(iv, c4b)
+        va = b.load(b.add(src, off))
+        b.store(b.add(out, off), va)
+        b.endfor()
+        b.ret()
+        assert self._reject_reason(b.program) == REASON_ALIASING_STORE
+
+    def test_cross_base_unknown_pointer_rejected(self):
+        """Review F3: non-constant bases cannot be proven disjoint."""
+        b = IRBuilder()
+        b.new_function("main")
+        b.new_block("entry")
+        src = b.make_value(name="src", dtype=DataType.INT32)
+        out = b.load_const(0x420000, dtype=DataType.INT32)
+        iv = b.for_loop(0, 16)
+        c4 = b.load_const(4, dtype=DataType.INT32)
+        off = b.mul(iv, c4)
+        va = b.load(b.add(src, off))
+        b.store(b.add(out, off), va)
+        b.endfor()
+        b.ret()
+        assert self._reject_reason(b.program) == REASON_ALIASING_STORE
+
+    def test_cross_base_distinct_constants_allowed(self):
+        """Distinct constant bases with disjoint ranges stay vectorizable."""
+        program = _make_map_loop(16)
+        vec = Vectorizer(program, width=4)
+        result = vec.run(program)
+        assert result.changes == 1
+        assert vec.last_report[0].status == "vectorized"
 
     def test_i3_dynamic_bounds(self):
         program = _make_map_loop(16)
@@ -415,3 +642,18 @@ class TestVectorizeReport:
         assert vec.last_report[1].status == "vectorized"
         assert len(result.warnings) == 1
         assert "rejected: no-memory-element-pattern" in result.warnings[0]
+
+
+# ── Width validation (review F6) ────────────────────────────────────────
+
+class TestVectorWidthValidation:
+    @pytest.mark.parametrize("width", [0, 1, -2, True, "4"])
+    def test_invalid_width_raises_value_error(self, width):
+        program = _make_map_loop(16)
+        with pytest.raises(ValueError, match="vector width"):
+            Vectorizer(program, width=width)
+
+    @pytest.mark.parametrize("width", [2, 4])
+    def test_valid_width_is_accepted(self, width):
+        program = _make_map_loop(16)
+        assert Vectorizer(program, width=width).width == width

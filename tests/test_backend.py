@@ -7,6 +7,7 @@ from scratchv.ir.types import DataType
 from scratchv.backend.instruction_select import InstructionSelector
 from scratchv.backend.register_alloc import RegisterAllocator, MachineOp
 from scratchv.backend.asm_emit import AsmEmitter
+from scratchv.backend.riscv_encoder import assemble_to_binary
 from scratchv.frontend.dsl_parser import DSLParser
 from scratchv.compiler import CompilerConfig, CompilerDriver
 from scratchv.main import args_to_config, build_arg_parser
@@ -228,6 +229,50 @@ class TestVectorDriverIntegration:
         assert result.success
         assert result.stats["opt_message"] == ""
         assert not re.search(r"^\s*v[a-z]", result.output_text, re.MULTILINE)
+
+    def test_vectorize_llvm_backend_rejected(self, monkeypatch, tmp_path):
+        """Review F5: the LLVM backend used to drop vector ops silently."""
+        driver = CompilerDriver(CompilerConfig(
+            vectorize=True, backend="llvm", reg_alloc="greedy"))
+        monkeypatch.setattr(driver, "_parse", lambda *a, **k: _vector_ir())
+        source = tmp_path / "input.dsl"
+        source.write_text("x = add(a, b)\n", encoding="utf-8")
+
+        result = driver.compile(str(source), str(tmp_path / "out.ll"))
+
+        assert result.success is False
+        assert any("llvm" in err.lower() for err in result.errors)
+        assert not (tmp_path / "out.ll").exists()
+
+    def test_vectorize_invalid_width_rejected(self, monkeypatch, tmp_path):
+        """Review F6: vector_width=0 used to raise ZeroDivisionError."""
+        driver = CompilerDriver(CompilerConfig(
+            vectorize=True, vector_width=0, reg_alloc="greedy"))
+        monkeypatch.setattr(driver, "_parse", lambda *a, **k: _vector_ir())
+        source = tmp_path / "input.dsl"
+        source.write_text("x = add(a, b)\n", encoding="utf-8")
+
+        result = driver.compile(str(source), str(tmp_path / "out.s"))
+
+        assert result.success is False
+        assert any("width" in err for err in result.errors)
+
+    def test_vectorize_linear_regalloc_falls_back_to_greedy(
+            self, monkeypatch, tmp_path):
+        """Review F7: the default linear allocator cannot emit labels."""
+        driver = CompilerDriver(CompilerConfig(
+            vectorize=True, vector_width=2))  # reg_alloc defaults to linear
+        monkeypatch.setattr(driver, "_parse", lambda *a, **k: _vector_ir())
+        source = tmp_path / "input.dsl"
+        source.write_text("x = add(a, b)\n", encoding="utf-8")
+
+        result = driver.compile(str(source), str(tmp_path / "out.s"))
+
+        assert result.success
+        assert driver.config.reg_alloc == "greedy"
+        assert any("greedy" in warning for warning in result.warnings)
+        assert ".label" not in result.output_text
+        assert len(assemble_to_binary(result.output_text)) > 0
 
 
 # ── Topic 29 P0: constant operands in R-type instructions ───────────────

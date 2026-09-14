@@ -116,9 +116,16 @@ C5 元素树：区域内每个标量指令必须属于下列之一
                 且 opcode ∈ {ADD, SUB, MUL, DIV, RELU, NEG}
             (c) LOAD_CONST
 C6 无跨迭代标量：区域内的定义只被区域内指令使用（SSA 名唯一，天然满足）；
-             iv 只允许出现在地址链的 MUL 中（其他使用 → 拒绝）
-C7 无别名：STORE 的 base 与 LOAD 的 base 不同（原地逐元素 `a[i]=f(a[i])` 允许，
-            即 STORE.base == 唯一 LOAD.base 且同 lane 偏移）；同一 base 多次 STORE → 拒绝
+            iv 只允许出现在地址链的 MUL 中（其他使用 → 拒绝）；
+            区域内的定义（含原 iv、区域内 LOAD/常量结果）不得在 FOR 区域外
+            被使用（live-out → 拒绝，region-value-escapes），因为重写会替换或
+            删除这些定义，否则会产生悬空 SSA 引用
+C7 无别名（浅别名分析，保守）：
+            (a) 同 base：仅允许“唯一 LOAD + 唯一 STORE 且 lane 偏移一致”的
+                原地模式（`a[i]=f(a[i])`）；同一 base 多次 STORE → 拒绝
+            (b) 异 base：仅当两个 base 均为常量绝对地址、且
+                [base, base + n*elem_bytes) 区间可证不重叠时才允许；
+                其余（异名指针、`src = sub(out, 4)` 等可重叠形态）→ 拒绝
 ```
 
 合法的可向量化循环模式（一期支持的三类）：
@@ -178,6 +185,7 @@ C7 无别名：STORE 的 base 与 LOAD 的 base 不同（原地逐元素 `a[i]=f
 | `REASON_NON_ELEMENTWISE_IV` | `non-elementwise-iv-use` | iv 用于非地址链 |
 | `REASON_ALIASING_STORE` | `aliasing-store` | C7 违反 |
 | `REASON_UNSUPPORTED_OP` | `unsupported-op` | C5 违反 |
+| `REASON_REGION_VALUE_ESCAPES` | `region-value-escapes` | 区域内定义在区域外被使用（live-out） |
 
 拒绝不是错误：管线继续编译标量程序，原因写入 `PassResult.warnings` 与 `Vectorizer.last_report`。
 

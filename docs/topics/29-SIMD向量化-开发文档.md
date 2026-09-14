@@ -46,6 +46,7 @@ REASON_NO_ELEMENT_PATTERN    = "no-memory-element-pattern"
 REASON_NON_ELEMENTWISE_IV    = "non-elementwise-iv-use"
 REASON_ALIASING_STORE        = "aliasing-store"
 REASON_UNSUPPORTED_OP        = "unsupported-op"
+REASON_REGION_VALUE_ESCAPES  = "region-value-escapes"
 ```
 
 报告记录：
@@ -306,27 +307,32 @@ def _fresh(self, prefix="v") -> str                               # "v_1", "v_2"
    - `opcode ∈ {ADD,SUB,MUL,DIV,RELU,NEG}` 且所有操作数 ∈ {常量, outer_defs, 已分类的元素结果} → `ELEM`（操作数中出现 `iv` → `REASON_NON_ELEMENTWISE_IV`）；
    - 其余 → `REASON_UNSUPPORTED_OP`；
    - 分类为 `ELEM`/`CONST` 但结果未被任何 STORE 使用 → `REASON_UNSUPPORTED_OP`（防死代码混入）。
-6. **C7 别名**：收集 `LOAD.base` 集合 `L` 与 `STORE.base` 集合 `S`；`S - L == ∅`（原地允许），且每个 base 的 STORE ≤ 1 条、且 STORE 与 LOAD 的偏移形式一致；否则 `REASON_ALIASING_STORE`。
-7. 通过后构造 `_Plan`：`n, W, strips, rem`，以及按原顺序排列的映射（`LOAD→VLOAD`、`STORE→VSTORE`、`RELU→VRELU`、`ADD→VADD`…）。
+6. **C6 live-out**：函数级扫描，区域内定义的任何值（含原 `iv`、区域内 LOAD 结果与常量）在 `region.body` 之外被使用 → `REASON_REGION_VALUE_ESCAPES`（保守拒绝；重写会替换或删除这些定义）。
+7. **C7 别名**（浅别名分析，保守）：同 base 仅允许“唯一 LOAD + 唯一 STORE 且 lane 偏移一致”的原地模式，同 base 多次 STORE → 拒绝；异 base 仅当两者均为常量绝对地址且 `[base, base + n*elem_bytes)` 可证不重叠时允许；其余 → `REASON_ALIASING_STORE`。
+8. 通过后构造 `_Plan`：`n, W, strips, rem`，以及按原顺序排列的映射（`LOAD→VLOAD`、`STORE→VSTORE`、`RELU→VRELU`、`ADD→VADD`…）。
 
 ### 4.5 重写算法
 
 - 用 `_fresh()` 生成 strip iv 与全部向量中间值的 `Value`（`shape=(W,)`，`dtype` 继承被替换指令的 `dest.dtype`）；
 - 地址链重建：`c_scale = load_const(W*elem_bytes)`（新的常量 Value）、`boff = mul(strip_iv, c_scale)`、`pa = add(base, boff)`；
 - 原地替换区域内容：`FOR` 的 `dest` 换为 strip iv、`attrs` 换为 `{start:0, end:strips, step:1, vector_width:W, elem_bytes, orig_trip:n}`；把 `ADDR/CONST/ELEM` 指令替换为对应向量指令；`LOAD/STORE` 替换为 `VLOAD/VSTORE`；保留 `ENDFOR`；
+- `_rewrite` 返回 `(vector_ops, new_end_index)`，其中 `new_end_index = for_index + 1 + len(new_body)` 是替换后 strip `ENDFOR` 的真实位置（`region.end_index` 在体长变化后失效，余数插入必须用它）；
 - **禁改**：区域外指令、`FOR` 之前/`ENDFOR` 之后的指令一律不动。
 
 ### 4.6 余数克隆
 
 ```python
-def _clone_remainder(block, region, plan):
+def _clone_remainder(block, region, plan, original_iv, new_end_index):
     if plan.rem == 0: return 0
-    new_for = Instruction(opcode=OpCode.FOR, dest=region.iv, attrs={
+    new_for = Instruction(opcode=OpCode.FOR, dest=original_iv, attrs={
         "start": plan.strips * plan.width, "end": plan.n, "step": 1})
     cloned = _clone_instrs(region.body, suffix="__rem")   # 深克隆 + def/use 同步改名
+    insert_at = new_end_index + 1                         # strip ENDFOR 之后
     block.instructions[insert_at:insert_at] = [new_for, *cloned, endfor]
     return 1
 ```
+
+余数块必须插在 strip `ENDFOR` 之后（与 strip 循环同级、且在 `return` 之前）；用旧的 `region.end_index + 1` 会导致新体更长时余数嵌进 strip 循环、新体更短时插到 `return` 之后成为死代码。`_skip_rewritten` 相应改为按块内顶层 `ENDFOR` 扫描定位下一次扫描起点。
 
 `_clone_instrs` 规则：为每个 `dest` 生成新 `Value(name + "__rem")`；克隆指令的 `operands` 中若引用被克隆的旧名则替换为新名，否则保持（区域外引用与常量不动）；`FOR/ENDFOR` 不入克隆体。
 
@@ -536,9 +542,15 @@ if self.config.use_dag_isel:
 
 ### 8.4 已知限制（集成时必须知晓，不在本期修）
 
-- `reg_alloc="linear"` 的 `LinearScanAllocator.emit` 把标签输出为 `.label name`、跳转目标只放在注释，导致编码阶段标签丢失（实测 `j  # .Lloop_header_1` → `IndexError`）。CLI 默认 `--reg-alloc greedy`，向量化验证路径使用 greedy；`CompilerConfig` 默认 `"linear"` 是既有不一致，建议在向量化开启且 `reg_alloc=="linear"` 时追加 warning 并回退 greedy（实现时可选项，需测试）。
+- `reg_alloc="linear"` 的 `LinearScanAllocator.emit` 把标签输出为 `.label name`、跳转目标只放在注释，导致编码阶段标签丢失（实测 `j  # .Lloop_header_1` → `IndexError`）。CLI 默认 `--reg-alloc greedy`，向量化验证路径使用 greedy；`CompilerConfig` 默认 `"linear"` 是既有不一致，**已实现**：向量化开启且 `reg_alloc=="linear"` 时追加 warning 并回退 greedy（见 8.5）。
 - `_select_alloca` 使用 `vreg("sp")` 会被寄存器分配改名（alloca 结果错误）。向量化样例与测试一律用 `load_const` 绝对地址作 base，避免 `alloca`；这是既有缺陷，单独跟踪。
 - `--extended-isel`、`--verify-ir` 存在“CLI 已声明但 `args_to_config` 未接线”的历史缺口；本期新增三参数必须双侧修改，并以 10.4 的接线测试守门。
+
+### 8.5 `compile()` 前置校验（评审修复 F5/F6/F7）
+
+- `vectorize and backend == "llvm"` → 直接返回 `success=False`，错误消息指明 Phase 1 只支持 RISC-V 后端（LLVM 后端会把向量 op 写成注释丢弃，属静默错误产物）。
+- `vector_width < 2`（或非 int）→ 在解析前返回 `success=False`，错误消息 `vector width must be an integer >= 2 (got ...)`；`Vectorizer.__init__` 内部同样调用 `validate_vector_width()` 抛 `ValueError`（API 防呆双保险）。
+- `vectorize and reg_alloc == "linear"` → 追加 warning 并把 config 回退到 `"greedy"`（线性扫描标签发射缺陷，见 8.4 第一条）。
 
 ---
 
@@ -815,5 +827,22 @@ P0 常量物化修复 + 回归            → P1 types/builder + 单测
 ### 已知限制
 
 - Phase 1 仅标量展开（`--vector-isa p/v` 显式拒绝）。
-- 未做 `linear` 自动回退 greedy（R7）。
 - 无任何性能声明（不把 loop 摊销当 SIMD 收益）。
+
+---
+
+## 评审修复（2026-09-14，分支 `impl/topic29`）
+
+> 对应评审：`GaoMD/ScratchV/Review/分支评审-2026-09-14/topic29-review.md`（评审对象 `88d9eed`）
+
+| 评审 ID | 修复 |
+|---|---|
+| F1（P0） | `_rewrite` 返回替换后 strip `ENDFOR` 的真实下标，`_clone_remainder` 以此插入余数块，`_skip_rewritten` 改为按块内顶层 `ENDFOR` 扫描定位；消除“长体嵌套 / 短体死代码”两种错位 |
+| F2（P0） | 新增 C6 live-out 检查：区域内定义（含原 `iv`）在 `region.body` 之外被使用 → `region-value-escapes` 拒绝，消除悬空 SSA |
+| F3（P1） | C7 收紧为同 base（唯一 LOAD+STORE、lane 一致）或异 base 常量绝对地址区间可证不重叠；其余异名可重叠 base → `aliasing-store` |
+| F4（P1） | 新增余数错位结构回归（N<B / N>B × W=2/4）、IV/区域值 live-out、异名 base 别名、宽度矩阵对拍（W×{整除,余数}×{map,广播,原地}，其中 W=4+余数的 map/广播受既有分配器 >19 vreg 缺陷限制，仅做结构覆盖） |
+| F5（P2） | `vectorize + backend=llvm` 在 `compile()` 前置拒绝（`success=False`） |
+| F6（P2） | `validate_vector_width()`：`width < 2` 或非 int 抛 `ValueError`；`compile()` 前置校验返回 `success=False`（不再 `ZeroDivisionError`） |
+| F7（P2） | `vectorize + reg_alloc=linear` 追加 warning 并回退 greedy（R7 落地） |
+
+修复后全量：`PYTHONPATH=. python3.11 -m pytest tests/ -q` → **753 passed / 0 failed**（修复前 720 passed）。
