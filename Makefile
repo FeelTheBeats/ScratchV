@@ -1,6 +1,12 @@
 # ScratchV developer makefile
 .POSIX:
 
+# Interpreter for every recipe. CI exports PY=python3.12: the self-hosted
+# runner's /usr/bin/python3 is 3.10, which has none of the dependencies
+# installed. Hardcoding python3 here made the same target pass on
+# ubuntu-latest and fail on that runner.
+PY ?= python3
+
 .PHONY: quick-start install test test-peephole ci-peephole bench bench-topic06 bench-cnn bench-ir-verifier clean lint docs
 
 # ── Beginner quick-start ─────────────────────────────────────────────────────
@@ -33,7 +39,7 @@ quick-start:
 # ── Course site (generated, not committed) ────────────────────────────────
 
 docs:
-	python3 scripts/build_docs_html.py
+	$(PY) scripts/build_docs_html.py
 
 # ── Installation ──────────────────────────────────────────────────────────
 
@@ -44,31 +50,31 @@ install:
 # ── 课题功能测试 ──────────────────────────────────────────────────────────
 
 test:
-	python3 -m pytest tests/ -v --tb=short
+	$(PY) -m pytest tests/ -v --tb=short
 
 # ── Topic 13 窥孔优化器（本地 / CI 对齐） ─────────────────────────────────
 
 test-peephole:
-	python3 -m pytest tests/test_asm_peephole*.py tests/test_bench_asm_peephole.py tests/test_compare_peephole.py tests/test_standalone_peephole.py tests/test_cnn_peephole_benchmark.py -v --tb=short
-	python3 -m scratchv.backend.asm_peephole --list-rules
-	python3 -m scratchv.backend.asm_peephole \
+	$(PY) -m pytest tests/test_asm_peephole*.py tests/test_bench_asm_peephole.py tests/test_compare_peephole.py tests/test_standalone_peephole.py tests/test_cnn_peephole_benchmark.py -v --tb=short
+	$(PY) -m scratchv.backend.asm_peephole --list-rules
+	$(PY) -m scratchv.backend.asm_peephole \
 		tests/fixtures/asm_peephole/input_addi_fusion.s \
 		-o /tmp/peephole_out.s --report --json
 
 ci-peephole: test-peephole
 	@mkdir -p benchmark_reports
-	python3 benchmarks/bench_asm_peephole.py \
+	$(PY) benchmarks/bench_asm_peephole.py \
 		--sizes 1 2 100 --fusion-ratio 0.3 --repeats 2 \
 		--output benchmark_reports/peephole_raw.json
-	python3 benchmarks/compare_peephole.py \
+	$(PY) benchmarks/compare_peephole.py \
 		--json benchmark_reports/peephole_compare.json \
 		--markdown benchmark_reports/peephole_compare.md
-	python3 benchmarks/compare_peephole_html.py \
+	$(PY) benchmarks/compare_peephole_html.py \
 		--repeats 2 --output-dir benchmark_reports
-	python3 benchmarks/compare_peephole_cnn.py \
+	$(PY) benchmarks/compare_peephole_cnn.py \
 		--model models/graph/cnn.onnx \
 		--json benchmark_reports/cnn_peephole_compare.json
-	python3 benchmarks/compare_peephole_html.py --unified \
+	$(PY) benchmarks/compare_peephole_html.py --unified \
 		--micro-json benchmark_reports/peephole_compare_html.json \
 		--dsl-json benchmark_reports/peephole_compare.json \
 		--cnn-json benchmark_reports/cnn_peephole_compare.json \
@@ -79,33 +85,33 @@ ci-peephole: test-peephole
 # ── 模型性能基准 ──────────────────────────────────────────────────────────
 
 bench:
-	python3 -m pytest benchmarks/test_benchmark.py -v --tb=short
-	python3 benchmarks/bench_runner.py benchmarks/cases \
+	$(PY) -m pytest benchmarks/test_benchmark.py -v --tb=short
+	$(PY) benchmarks/bench_runner.py benchmarks/cases \
 		--output-json benchmark_reports/dsl_bench.json \
 		--output-html benchmark_reports/dsl_bench.html
 
 # ── Topic 21 IR verification overhead ────────────────────────────────────
 
 bench-ir-verifier:
-	python3 -m benchmarks.bench_ir_verifier
+	$(PY) -m benchmarks.bench_ir_verifier
 
 # ── Topic 06 DSL correctness + TinyFive benchmark ─────────────────────────
 
 bench-topic06:
-	python3 scripts/run_topic06_benchmarks.py
-	python3 scripts/generate_topic06_report.py
+	$(PY) scripts/run_topic06_benchmarks.py
+	$(PY) scripts/generate_topic06_report.py
 
 # ── CNN RISC-V 编译 + 估算 ────────────────────────────────────────────────
 
 bench-cnn:
-	python3 scratchv/standalone/onnx_to_riscv_standalone.py models/graph/cnn.onnx \
+	$(PY) scratchv/standalone/onnx_to_riscv_standalone.py models/graph/cnn.onnx \
 		-o /tmp/cnn_riscv.bin --estimate --report
 	@echo "Reports: benchmark_reports/"
 
 # ── CNN RISC-V 编译 + TinyFive 仿真验证 ───────────────────────────────────
 
 bench-tinyfive:
-	python3 scratchv/standalone/onnx_to_riscv_standalone.py models/graph/cnn.onnx \
+	$(PY) scratchv/standalone/onnx_to_riscv_standalone.py models/graph/cnn.onnx \
 		-o /tmp/cnn_riscv.bin --estimate --tinyfive --tinyfive-max-instr 200000
 	@echo "TinyFive simulation complete."
 
@@ -113,7 +119,7 @@ bench-tinyfive:
 
 bench-ci:
 	@mkdir -p benchmark_reports
-	python3 scratchv/ci/ci_benchmark.py \
+	$(PY) scratchv/ci/ci_benchmark.py \
 		--model-registry ci_models.json \
 		--output-dir benchmark_reports/ \
 		--html dashboard.html \
@@ -129,25 +135,25 @@ bench-ci:
 # ── ONNX 模型拆分 ────────────────────────────────────────────────────────
 
 split-models:
-	python3 scripts/split_cnn_to_single_ops.py
+	$(PY) scripts/split_cnn_to_single_ops.py
 	@echo "Single-op models: models/single_op/"
 
 # ── 单算子 Benchmark ─────────────────────────────────────────────────────
 
 bench-single-ops: split-models
-	python3 scripts/bench_single_ops.py
+	$(PY) scripts/bench_single_ops.py
 	@echo "Single-op benchmark: benchmark_reports/single_op_bench.json"
 
 # ── Dashboard (仅指令集维度 + 算子粒度) ──────────────────────────────────
 
 bench-dashboard:
-	python3 scratchv/ci/dashboard.py --run -o benchmark_reports/dashboard.html
+	$(PY) scratchv/ci/dashboard.py --run -o benchmark_reports/dashboard.html
 	@echo "Dashboard: benchmark_reports/dashboard.html"
 
 # ── 优化历史页面 ─────────────────────────────────────────────────────────
 
 bench-history:
-	python3 scratchv/ci/history_page.py -o benchmark_reports/history.html
+	$(PY) scratchv/ci/history_page.py -o benchmark_reports/history.html
 	@echo "History page: benchmark_reports/history.html"
 
 # ── 全量报告 (dashboard + history) ───────────────────────────────────────
@@ -167,5 +173,5 @@ clean:
 # ── Lint (development only) ───────────────────────────────────────────────
 
 lint:
-	-python3 -m flake8 scratchv/ scratchv_dag/ tests/ 2>/dev/null || echo "pip install flake8"
-	-python3 -m mypy scratchv/ scratchv_dag/ --ignore-missing-imports 2>/dev/null || echo "pip install mypy"
+	-$(PY) -m flake8 scratchv/ scratchv_dag/ tests/ 2>/dev/null || echo "pip install flake8"
+	-$(PY) -m mypy scratchv/ scratchv_dag/ --ignore-missing-imports 2>/dev/null || echo "pip install mypy"
