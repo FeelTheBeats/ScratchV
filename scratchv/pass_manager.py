@@ -38,12 +38,18 @@ class PassManager:
         report = pm.run(program)
     """
 
-    def __init__(self, name: str = "pipeline"):
+    def __init__(self, name: str = "pipeline", *,
+                 before_pass: Callable | None = None,
+                 after_pass: Callable | None = None,
+                 data_type: type | None = None):
         if not isinstance(name, str):
             raise TypeError("pipeline name must be a string")
         if not name.strip():
             raise ValueError("pipeline name must not be empty")
         self._name = name
+        self.before_pass = before_pass
+        self.after_pass = after_pass
+        self.data_type = data_type
         self._passes: list[OptimizationPass | CompilerPass] = []
 
     @property
@@ -88,10 +94,16 @@ class PassManager:
         return self._execute(input_data, in_place=False)
 
     def _execute(self, input_data: Any, *, in_place: bool) -> PipelineResult:
+        if self.data_type is not None and not isinstance(input_data, self.data_type):
+            raise TypeError(f"Pipeline requires {self.data_type.__name__}")
         data = input_data
         warnings: list[str] = []
         executions: list[PassExecutionStats] = []
         for index, pass_ in enumerate(self._passes):
+            # Validation callbacks run outside pass timing and error wrapping.
+            # Their caller owns structured diagnostics and failure handling.
+            if self.before_pass is not None:
+                self.before_pass(pass_, data)
             t0 = time.perf_counter()
             try:
                 if isinstance(pass_, OptimizationPass):
@@ -104,6 +116,8 @@ class PassManager:
                         raise TypeError("CompilerPass must return PassResult")
                     if not result.success:
                         raise ValueError(result.message or "pass produced no data")
+                if self.data_type is not None and not isinstance(result.data, self.data_type):
+                    raise TypeError(f"Pass '{pass_.name}' must return {self.data_type.__name__}")
                 if in_place and result.data is not input_data:
                     raise ValueError(
                         "run() requires in-place IR passes; use run_pipeline() for replacement data"
@@ -131,6 +145,8 @@ class PassManager:
                     elapsed_seconds=elapsed,
                 )
             )
+            if self.after_pass is not None:
+                self.after_pass(pass_, data)
 
         return PipelineResult(data, self._make_report(executions), tuple(warnings))
 

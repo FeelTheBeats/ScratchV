@@ -27,7 +27,7 @@ from scratchv.pass_interface import (
     OptimizationPassError,
     OptimizationReport,
 )
-from scratchv.pass_manager import PassManager, create_optimization_pass_manager
+from scratchv.pass_manager import PipelineResult, PassManager, create_optimization_pass_manager
 
 __all__ = [
     "CompileResult",
@@ -54,6 +54,7 @@ class CompilerConfig:
         reg_alloc:      ``"naive"`` or ``"greedy"`` (also ``"linear"``).
         dump_ir:        Print IR dumps during compilation.
         verify:         Run ONNX Runtime / numpy verification.
+        verify_ir:      Validate shared IR at parse/pass/codegen boundaries.
         rtol:           Relative tolerance for verification.
         atol:           Absolute tolerance for verification.
         use_logger:     Use structured logger instead of print().
@@ -92,6 +93,7 @@ class CompilerConfig:
     branch_predictor: str = "always_not_taken"
     passes: tuple[str, ...] | None = None
     disabled_passes: tuple[str, ...] = ()
+    verify_ir: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -123,6 +125,7 @@ class CompileResult:
     diagnostics: list[Any] = field(default_factory=list)
     diagnostic_limit_reached: bool = False
     diagnostic_limit: int = 20
+    ir_diagnostics: list[Any] = field(default_factory=list)
 
     def summary(self) -> str:
         """Return a one-line summary."""
@@ -134,6 +137,14 @@ class CompileResult:
 # ═══════════════════════════════════════════════════════════════════════════════
 # CompilerDriver
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+class _IRValidationFailed(Exception):
+    """Internal control transfer; converted at the compilation boundary."""
+
+    def __init__(self, issues):
+        self.issues = issues
+        super().__init__("IR verification failed")
 
 
 class CompilerDriver:
@@ -157,7 +168,27 @@ class CompilerDriver:
 
     # ── Public API ──────────────────────────────────────────────────────────
 
-    def compile(
+    def compile(self, input_path: str, output_path: str | None = None,
+                dsl_source: str | None = None) -> CompileResult:
+        """Compile an ONNX/DSL input, returning diagnostics before output on failure.
+
+        ``dsl_source`` supplies inline DSL; otherwise ``input_path`` is read.
+        ``output_path`` defaults to output.s or output.ll for the chosen backend.
+        """
+        self._ir_warnings = []
+        self._ir_diagnostics = []
+        try:
+            result = self._compile(input_path, output_path, dsl_source)
+        except _IRValidationFailed as exc:
+            result = CompileResult(
+                success=False,
+                errors=[str(issue) for issue in exc.issues if issue.level.value == "error"],
+            )
+        result.ir_diagnostics = list(self._ir_diagnostics)
+        result.warnings = self._ir_warnings + result.warnings
+        return result
+
+    def _compile(
         self,
         input_path: str,
         output_path: str | None = None,
@@ -235,20 +266,22 @@ class CompilerDriver:
                 errors=[f"Parse error: {e}"],
             )
 
+        if self.config.verify_ir:
+            self._check_ir(program, "after-parse")
+
         ir_dump_before = ""
         if self.config.dump_ir:
             from scratchv.ir.printer import IRPrinter
 
             ir_dump_before = IRPrinter(program).dump()
 
-        # --- 2. Verify IR (if configured) ---
-        if self.config.use_logger:
-            self._verify_ir(program, warnings)
-
         # --- 3. Optimize ---
         opt_message = ""
         try:
-            optimization_report = self._run_optimizations(program)
+            optimization_result = self._run_optimizations(program)
+            program = optimization_result.data
+            warnings.extend(optimization_result.warnings)
+            optimization_report = optimization_result.report
         except (OptimizationPassError, TypeError, ValueError) as exc:
             if isinstance(exc, OptimizationPassError):
                 completed_report = exc.completed_report
@@ -284,6 +317,8 @@ class CompilerDriver:
             )
 
         # --- 4. Code generation ---
+        if self.config.verify_ir:
+            self._check_ir(program, "before-codegen")
         try:
             asm_text = self._generate_code(program)
         except Exception as e:  # noqa: BLE001
@@ -379,29 +414,31 @@ class CompilerDriver:
 
     # ── Internal: verify IR ─────────────────────────────────────────────────
 
-    def _verify_ir(self, program, warnings: list[str]) -> None:
-        """Run IR verifier and collect warnings."""
-        from scratchv.analysis.ir_verifier import IRVerifier
-
-        verifier = IRVerifier(program)
-        issues = verifier.verify()
-        for issue in issues:
-            msg = str(issue)
-            if issue.level.value == "error":
-                warnings.append(f"IR: {msg}")
-            else:
-                warnings.append(f"IR(warning): {msg}")
+    def _check_ir(self, program, stage: str) -> None:
+        """Check the current Program and stop before any backend/output action."""
+        from scratchv.analysis.ir_verifier import verify_ir
+        if not isinstance(program, Program):
+            raise TypeError(f"IR pipeline at {stage} must return Program")
+        passed, issues = verify_ir(program, stage=stage)
+        self._ir_diagnostics.extend(issues)
+        self._ir_warnings.extend(str(i) for i in issues if i.level.value == "warning")
+        if not passed:
+            raise _IRValidationFailed(issues)
 
     # ── Internal: optimizations ─────────────────────────────────────────────
 
-    def _run_optimizations(self, program: Program) -> OptimizationReport:
+    def _run_optimizations(self, program: Program) -> PipelineResult:
         """Run all configured optimization passes."""
         manager = create_optimization_pass_manager(
             self.config.optimize_level,
             passes=self.config.passes,
             disabled_passes=self.config.disabled_passes,
         )
-        return manager.run(program)
+        manager.data_type = Program
+        if self.config.verify_ir:
+            manager.before_pass = lambda pass_, data: self._check_ir(data, f"before:{pass_.name}")
+            manager.after_pass = lambda pass_, data: self._check_ir(data, f"after:{pass_.name}")
+        return manager.run_pipeline(program)
 
     def _optimization_stats(self, report: OptimizationReport) -> dict[str, Any]:
         """Convert an immutable report to the CompileResult stats schema."""

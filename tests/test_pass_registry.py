@@ -191,7 +191,7 @@ class TestCliAndDriver:
                 ]
             )
         )
-        report = CompilerDriver(config)._run_optimizations(constant_program()[0])
+        report = CompilerDriver(config)._run_optimizations(constant_program()[0]).report
         assert [item.name for item in report.executions] == ["dead-code-elim"]
 
     def test_invalid_name_does_not_overwrite_existing_output(self, tmp_path, capsys):

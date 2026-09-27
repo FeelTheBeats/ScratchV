@@ -194,6 +194,7 @@ def args_to_config(args: argparse.Namespace) -> CompilerConfig:
         reg_alloc=args.reg_alloc,
         dump_ir=args.dump_ir,
         verify=args.verify,
+        verify_ir=args.verify_ir,
         rtol=args.rtol,
         atol=args.atol,
         use_logger=args.log_level is not None,
@@ -320,6 +321,14 @@ def main(argv: list[str] | None = None) -> int:
     if result.ir_dump:
         print(result.ir_dump, file=sys.stderr)
 
+    # Structured IR diagnostics contain snapshots from the failing/warning
+    # stage. Render them once; retain compact errors/warnings for API callers.
+    ir_messages = {str(issue) for issue in result.ir_diagnostics}
+    if result.ir_diagnostics:
+        from scratchv.analysis.ir_diagnostics import render_ir_error
+        for issue in result.ir_diagnostics:
+            print(render_ir_error(issue, stream=sys.stderr), file=sys.stderr)
+
     if result.success:
         if args.emit_register_map:
             register_map_path = Path(args.emit_register_map)
@@ -344,7 +353,8 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         for w in result.warnings:
-            print(f"  note: {w}", file=sys.stderr)
+            if w not in ir_messages:
+                print(f"  note: {w}", file=sys.stderr)
         if result.stats.get("opt_message"):
             print(f"  optimizer: {result.stats['opt_message']}", file=sys.stderr)
         if result.stats.get("cycle_report"):
@@ -378,7 +388,8 @@ def main(argv: list[str] | None = None) -> int:
                 )
         else:
             for err in result.errors:
-                print(f"Error: {err}", file=sys.stderr)
+                if err not in ir_messages:
+                    print(f"Error: {err}", file=sys.stderr)
         return 1
 
 
