@@ -88,6 +88,36 @@ jobs:
           $PY -m pip install -e ".[all]"
           $PY -m pip install "pytest>=7,<10"
 
+      - name: Run Topic 04 PassManager regressions
+        id: topic04_pass_manager
+        env:
+          PYTHONHASHSEED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark_reports
+          $PY -m pytest \
+            tests/test_pass_manager.py \
+            tests/test_pass_registry.py \
+            tests/test_optimizer.py \
+            tests/test_optimizer_advanced.py \
+            -v --tb=short \
+            --junit-xml=benchmark_reports/topic04_pass_manager.xml \
+            | tee benchmark_reports/topic04_pass_manager.txt
+
+      - name: Summarize Topic 04 PassManager results
+        if: always()
+        env:
+          TOPIC04_OUTCOME: ${{ steps.topic04_pass_manager.outcome }}
+        run: |
+          {
+            echo "## Topic 04 PassManager"
+            echo "Result: $TOPIC04_OUTCOME"
+            echo ""
+            echo "Coverage: pass registration, enable/disable switches, constant folding, functional pipelines, and optimizer regressions."
+            echo ""
+            echo "JUnit XML and detailed test output are included in the test-reports artifact when tests run."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Prepare RISC-V test tools
         run: |
           set -euo pipefail
@@ -187,6 +217,8 @@ jobs:
           path: |
             benchmark_reports/test_results.xml
             benchmark_reports/tests.html
+            benchmark_reports/topic04_pass_manager.xml
+            benchmark_reports/topic04_pass_manager.txt
           retention-days: 30
 
   # ═════════════════════════════════════════════════════════════════════════
