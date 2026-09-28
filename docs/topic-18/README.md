@@ -1,6 +1,6 @@
 # Topic 18：指令调度
 
-当前实现对寄存器分配后的汇编做局部换序，使用 LLVM MCA / SiFive E76 评估收益。仓库中的评测结果使用 LLVM 18.1.3；复现这些数值时使用该版本。日常运行和 CI 不锁定 LLVM 版本，报告记录实际工具版本。报告统计发射峰值、零发射周期和局部完成周期。
+当前实现对寄存器分配后的汇编做局部换序，使用 LLVM MCA / SiFive E76 评估收益。仓库中的评测结果使用 LLVM 18.1.3；复现这些数值时使用该版本。CI 固定使用 LLVM 18（`llvm-mca-18`），本地运行不限制版本，报告记录实际工具版本。报告统计发射峰值、零发射周期和局部完成周期。
 
 | 文件 | 用途 |
 |---|---|
@@ -20,4 +20,4 @@ PYTHONHASHSEED=0 python -m benchmarks.bench_cnn_schedule --llvm-mca llvm-mca-18
 
 生成报告：`benchmark_reports/inst_scheduler_cnn.md`；数据：同名 JSON；汇编和二进制：`benchmark_reports/cnn_schedule/`。
 
-上述命令用于复现 LLVM 18.1.3 的结果，运行前需确认 `llvm-mca-18 --version`。日常评测可省略 `--llvm-mca`，默认使用 `llvm-mca`，也可通过 `LLVM_MCA` 指定其他路径。
+上述命令用于复现 LLVM 18.1.3 的结果，运行前需确认 `llvm-mca-18 --version`。CI 通过 job 级 `LLVM_MCA: llvm-mca-18` 固定该版本，调度测试的期望值按 LLVM 18 标定；本地评测可省略 `--llvm-mca`，默认使用 `llvm-mca`，也可通过 `LLVM_MCA` 指定其他路径。
