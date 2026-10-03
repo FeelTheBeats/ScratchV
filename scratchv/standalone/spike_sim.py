@@ -12,7 +12,7 @@ collect:
   - Instruction trace samples
   - Spike execution time
 
-Spike binary:  /home/kinsomwang/workspace/coralnpu-spike-rv32/bin/spike
+Spike binary:  $SCRATCHV_SPIKE, else `spike` resolved on PATH (no hardcoded path)
 ScratchV binary: output.bin
 
 Usage:
@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -34,9 +35,16 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 # ── Paths ──────────────────────────────────────────────────────────────────
-SPIKE = "/home/kinsomwang/workspace/coralnpu-spike-rv32/bin/spike"
-SPIKE_DASM = "/home/kinsomwang/workspace/coralnpu-spike-rv32/bin/spike-dasm"
-SPIKE_LOG_PARSER = "/home/kinsomwang/workspace/coralnpu-spike-rv32/bin/spike-log-parser"
+# Resolve Spike tools portably: explicit env override first, then PATH.
+# No hardcoded machine-specific paths.
+def _resolve_tool(name: str, env_var: str) -> str:
+    """Resolve a Spike tool path: env override → PATH lookup → bare name."""
+    return os.environ.get(env_var) or shutil.which(name) or name
+
+
+SPIKE = _resolve_tool("spike", "SCRATCHV_SPIKE")
+SPIKE_DASM = _resolve_tool("spike-dasm", "SCRATCHV_SPIKE_DASM")
+SPIKE_LOG_PARSER = _resolve_tool("spike-log-parser", "SCRATCHV_SPIKE_LOG_PARSER")
 
 # ── Constants ──────────────────────────────────────────────────────────────
 ELF_BASE = 0x80000000       # RISC-V DRAM base (Spike default)
