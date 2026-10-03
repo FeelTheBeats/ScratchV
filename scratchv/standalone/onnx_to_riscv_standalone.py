@@ -154,6 +154,7 @@ def _safe_decode(b: object) -> str:
 
 # ONNX data type constants
 ONNX_FLOAT = 1
+ONNX_INT32 = 6
 ONNX_INT64 = 7
 
 
@@ -394,6 +395,25 @@ class ONNXModel:
                         arr.append(struct.pack("<f", v))
                 tensor.data = b"".join(arr)
 
+        # int32_data (field 5, packed — fallback for INT32 tensors)
+        # Negative int32 values are encoded as sign-extended varints; wrap them
+        # back to 32-bit two's complement before packing.
+        if not tensor.data and 5 in f and tensor.data_type == ONNX_INT32:
+            d5 = f[5]
+            if isinstance(d5, bytes):
+                vals = _parse_packed_varints(d5)
+            elif isinstance(d5, list):
+                vals = [int(v) if isinstance(v, int) else 0 for v in d5]
+            else:
+                vals = []
+            out = []
+            for v in vals:
+                u = v & 0xFFFFFFFF
+                if u >= 0x80000000:
+                    u -= 0x100000000
+                out.append(struct.pack("<i", u))
+            tensor.data = b"".join(out)
+
         # int64_data (field 7, packed — fallback for INT64 tensors)
         if not tensor.data and 7 in f:
             id7 = f[7]
@@ -428,6 +448,8 @@ class ONNXModel:
                 raw_size = len(fields[9])
                 if data_type == ONNX_FLOAT and raw_size == n * 4:
                     return (n,)
+                if data_type == ONNX_INT32 and raw_size == n * 4:
+                    return (n,)
                 if data_type == ONNX_INT64 and raw_size == n * 8:
                     return (n,)
             return (n,)
@@ -438,6 +460,8 @@ class ONNXModel:
         if 9 in fields and isinstance(fields[9], bytes):
             raw_size = len(fields[9])
             if data_type == ONNX_FLOAT:
+                return (raw_size // 4,)
+            if data_type == ONNX_INT32:
                 return (raw_size // 4,)
             if data_type == ONNX_INT64:
                 return (raw_size // 8,)
@@ -1108,6 +1132,13 @@ class MemoryPlan:
             # Convert to Q16.16
             if tensor.data_type == ONNX_FLOAT:
                 q16_vals = float32_to_q16(tensor.data)
+            elif tensor.data_type == ONNX_INT32:
+                # INT32 tensors (e.g. CSR col_indices / row_ptr) are stored
+                # verbatim as one 32-bit word per element — do NOT run them
+                # through the Q16.16 conversion.
+                n = len(tensor.data) // 4
+                int_vals = struct.unpack(f"<{n}i", tensor.data)
+                q16_vals = [v & 0xFFFFFFFF for v in int_vals]
             elif tensor.data_type == ONNX_INT64:
                 # INT64 tensors (like Reshape target shapes) — keep as-is
                 q16_vals = []
