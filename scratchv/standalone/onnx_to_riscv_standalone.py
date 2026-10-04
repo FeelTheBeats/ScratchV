@@ -3223,6 +3223,354 @@ class CNNRISCVGenerator:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+def _emit_platform_fwht() -> str:
+    """Size-independent FWHT kernel (platform ABI: a0=in, a1=out, a2=N)."""
+    lines = [
+        "# ScratchV platform kernel: FWHT (size-independent, a2 = N)",
+        "    .option norelax",
+        "    .text",
+        "    .globl cnn_entry",
+        "    .type cnn_entry, @function",
+        "cnn_entry:",
+        "    mv   t0, a0                 # src = in",
+        "    mv   t1, a1                 # dst = out",
+        "    mv   t2, a2                 # N",
+        "    mv   t3, zero               # i",
+        "_p_fwht_copy:",
+        "    lw   t4, 0(t0)",
+        "    sw   t4, 0(t1)",
+        "    addi t0, t0, 4",
+        "    addi t1, t1, 4",
+        "    addi t3, t3, 1",
+        "    blt  t3, t2, _p_fwht_copy",
+        "    li   t5, 1                  # length = 1",
+        "_p_fwht_len:",
+        "    bge  t5, t2, _p_fwht_done",
+        "    slli t6, t5, 1              # step = 2*length",
+        "    li   s2, 0                  # i = block start",
+        "_p_fwht_i:",
+        "    bge  s2, t2, _p_fwht_next_len",
+        "    li   s3, 0                  # j = 0",
+        "_p_fwht_j:",
+        "    bge  s3, t5, _p_fwht_next_block",
+        "    add  s4, s2, s3             # idx = i + j",
+        "    slli s5, s4, 2",
+        "    add  s6, a1, s5             # &a[idx]",
+        "    add  s7, s4, t5             # idx + length",
+        "    slli s7, s7, 2",
+        "    add  s8, a1, s7             # &a[idx+length]",
+        "    lw   s9, 0(s6)              # u",
+        "    lw   s10, 0(s8)             # v",
+        "    add  s11, s9, s10           # u+v",
+        "    sw   s11, 0(s6)",
+        "    sub  s11, s9, s10           # u-v",
+        "    sw   s11, 0(s8)",
+        "    addi s3, s3, 1",
+        "    j    _p_fwht_j",
+        "_p_fwht_next_block:",
+        "    add  s2, s2, t6",
+        "    j    _p_fwht_i",
+        "_p_fwht_next_len:",
+        "    slli t5, t5, 1",
+        "    j    _p_fwht_len",
+        "_p_fwht_done:",
+        "    ret",
+        "    .size cnn_entry, . - cnn_entry",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _emit_platform_conv() -> str:
+    """Size-independent direct Conv2D kernel (platform ABI).
+
+    a0 = input (NCHW), a1 = output (NCHW), a2 = param block
+    (N,C_in,H,W,C_out,K,pad,stride,H_out,W_out,w_ptr,b_ptr).
+    Semantics per docs/输入规范.md section 3.5.
+    """
+    lines = [
+        "# ScratchV platform kernel: direct Conv2D (size-independent)",
+        "    .option norelax",
+        "    .text",
+        "    .globl cnn_entry",
+        "    .type cnn_entry, @function",
+        "cnn_entry:",
+        "    lw   s0, 0(a2)              # N",
+        "    lw   s1, 4(a2)              # C_in",
+        "    lw   s2, 8(a2)              # H",
+        "    lw   s3, 12(a2)             # W",
+        "    lw   s4, 16(a2)             # C_out",
+        "    lw   s5, 20(a2)             # K",
+        "    lw   s6, 24(a2)             # pad",
+        "    lw   s7, 32(a2)             # H_out",
+        "    lw   s8, 36(a2)             # W_out",
+        "    lw   s9, 40(a2)             # w_ptr",
+        "    lw   s10, 44(a2)            # b_ptr",
+        "    mv   s11, a0                # in base",
+        "    mv   a7, a1                 # out base",
+        "    li   t0, 0                  # n = 0",
+        "_p_conv_n:",
+        "    bge  t0, s0, _p_conv_done",
+        "    li   t1, 0                  # oc = 0",
+        "_p_conv_oc:",
+        "    bge  t1, s4, _p_conv_next_n",
+        "    li   t2, 0                  # oh = 0",
+        "_p_conv_oh:",
+        "    bge  t2, s7, _p_conv_next_oc",
+        "    li   t3, 0                  # ow = 0",
+        "_p_conv_ow:",
+        "    bge  t3, s8, _p_conv_next_oh",
+        "    li   t6, 0                  # acc = 0",
+        "    beq  s10, zero, _p_conv_nobias",
+        "    slli a3, t1, 2",
+        "    add  a3, s10, a3",
+        "    lw   t6, 0(a3)              # acc = bias[oc]",
+        "_p_conv_nobias:",
+        "    li   t4, 0                  # ic = 0",
+        "_p_conv_ic:",
+        "    bge  t4, s1, _p_conv_store",
+        "    li   t5, 0                  # kh = 0",
+        "_p_conv_kh:",
+        "    bge  t5, s5, _p_conv_next_ic",
+        "    li   a6, 0                  # kw = 0",
+        "_p_conv_kw:",
+        "    bge  a6, s5, _p_conv_next_kh",
+        "    add  a3, t2, t5",
+        "    sub  a3, a3, s6             # ih",
+        "    add  a4, t3, a6",
+        "    sub  a4, a4, s6             # iw",
+        "    blt  a3, zero, _p_conv_kw_skip",
+        "    bge  a3, s2, _p_conv_kw_skip",
+        "    blt  a4, zero, _p_conv_kw_skip",
+        "    bge  a4, s3, _p_conv_kw_skip",
+        "    mul  a5, t0, s1",
+        "    add  a5, a5, t4",
+        "    mul  a5, a5, s2",
+        "    add  a5, a5, a3",
+        "    mul  a5, a5, s3",
+        "    add  a5, a5, a4",
+        "    slli a5, a5, 2",
+        "    add  a5, s11, a5",
+        "    lw   a5, 0(a5)              # in value",
+        "    mul  a4, t1, s1",
+        "    add  a4, a4, t4",
+        "    mul  a4, a4, s5",
+        "    add  a4, a4, t5",
+        "    mul  a4, a4, s5",
+        "    add  a4, a4, a6",
+        "    slli a4, a4, 2",
+        "    add  a4, s9, a4",
+        "    lw   a4, 0(a4)              # weight value",
+        "    mul  a5, a5, a4",
+        "    srai a5, a5, 16",
+        "    add  t6, t6, a5             # acc += prod",
+        "_p_conv_kw_skip:",
+        "    addi a6, a6, 1",
+        "    j    _p_conv_kw",
+        "_p_conv_next_kh:",
+        "    addi t5, t5, 1",
+        "    j    _p_conv_kh",
+        "_p_conv_next_ic:",
+        "    addi t4, t4, 1",
+        "    j    _p_conv_ic",
+        "_p_conv_store:",
+        "    mul  a3, t0, s4",
+        "    add  a3, a3, t1",
+        "    mul  a3, a3, s7",
+        "    add  a3, a3, t2",
+        "    mul  a3, a3, s8",
+        "    add  a3, a3, t3",
+        "    slli a3, a3, 2",
+        "    add  a3, a7, a3",
+        "    sw   t6, 0(a3)",
+        "    addi t3, t3, 1",
+        "    j    _p_conv_ow",
+        "_p_conv_next_oh:",
+        "    addi t2, t2, 1",
+        "    j    _p_conv_oh",
+        "_p_conv_next_oc:",
+        "    addi t1, t1, 1",
+        "    j    _p_conv_oc",
+        "_p_conv_next_n:",
+        "    addi t0, t0, 1",
+        "    j    _p_conv_n",
+        "_p_conv_done:",
+        "    ret",
+        "    .size cnn_entry, . - cnn_entry",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _emit_platform_spmm() -> str:
+    """Size-independent CSR SpMM kernel (platform ABI).
+
+    a0 = CSR block (values_ptr, col_ptr, row_ptr), a1 = out (M*N), a2 = params
+    (M, K, N, nnz, B_ptr). Semantics per docs/输入规范.md section 4.5.
+    """
+    lines = [
+        "# ScratchV platform kernel: CSR SpMM (size-independent)",
+        "    .option norelax",
+        "    .text",
+        "    .globl cnn_entry",
+        "    .type cnn_entry, @function",
+        "cnn_entry:",
+        "    lw   t2, 0(a0)              # values_ptr",
+        "    lw   t3, 4(a0)              # col_ptr",
+        "    lw   t4, 8(a0)              # row_ptr",
+        "    lw   t5, 0(a2)              # M",
+        "    lw   t6, 8(a2)              # N",
+        "    lw   s2, 16(a2)             # B_ptr",
+        "    mv   a0, t2                 # values",
+        "    mv   a2, t3                 # col",
+        "    mv   a3, t4                 # row_ptr",
+        "    mv   a4, t5                 # M",
+        "    mv   a5, t6                 # N",
+        "    mv   a6, s2                 # B",
+        "    li   s3, 0                  # i = 0",
+        "_p_spmm_i:",
+        "    bge  s3, a4, _p_spmm_done",
+        "    slli t0, s3, 2",
+        "    add  t0, a3, t0             # &row_ptr[i]",
+        "    lw   s5, 0(t0)              # j = row_ptr[i]",
+        "    lw   s6, 4(t0)              # j_end = row_ptr[i+1]",
+        "    li   s4, 0                  # n = 0",
+        "_p_spmm_zero:",
+        "    mul  t0, s3, a5",
+        "    add  t0, t0, s4",
+        "    slli t0, t0, 2",
+        "    add  t0, a1, t0",
+        "    sw   zero, 0(t0)",
+        "    addi s4, s4, 1",
+        "    blt  s4, a5, _p_spmm_zero",
+        "_p_spmm_j:",
+        "    bge  s5, s6, _p_spmm_next_i",
+        "    slli t1, s5, 2",
+        "    add  t1, a0, t1",
+        "    lw   t1, 0(t1)              # a = values[j]",
+        "    slli t0, s5, 2",
+        "    add  t0, a2, t0",
+        "    lw   t0, 0(t0)              # k = col[j]",
+        "    li   s4, 0                  # n = 0",
+        "_p_spmm_n:",
+        "    mul  t2, t0, a5",
+        "    add  t2, t2, s4",
+        "    slli t2, t2, 2",
+        "    add  t2, a6, t2",
+        "    lw   t2, 0(t2)              # B[k,n]",
+        "    mul  t2, t1, t2",
+        "    srai t2, t2, 16",
+        "    mul  t3, s3, a5",
+        "    add  t3, t3, s4",
+        "    slli t3, t3, 2",
+        "    add  t3, a1, t3",
+        "    lw   t4, 0(t3)",
+        "    add  t4, t4, t2",
+        "    sw   t4, 0(t3)",
+        "    addi s4, s4, 1",
+        "    blt  s4, a5, _p_spmm_n",
+        "    addi s5, s5, 1",
+        "    j    _p_spmm_j",
+        "_p_spmm_next_i:",
+        "    addi s3, s3, 1",
+        "    j    _p_spmm_i",
+        "_p_spmm_done:",
+        "    ret",
+        "    .size cnn_entry, . - cnn_entry",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def emit_platform_asm(generator, weight_data: bytes, model=None) -> str:
+    """Render a platform-standard, clang-assemblable listing (``--platform-asm``).
+
+    If *model* is a single size-independent-supported problem node (currently
+    FWHT), emit the dedicated runtime-sized kernel; otherwise emit the
+    fixed-shape standard listing (B-1).
+    """
+    if model is not None and len(model.nodes) == 1 and model.nodes[0].op_type == "Fwht":
+        return _emit_platform_fwht()
+    if model is not None and len(model.nodes) == 1 and model.nodes[0].op_type == "SpmmCsr":
+        return _emit_platform_spmm()
+    if model is not None and len(model.nodes) == 1 and model.nodes[0].op_type == "Conv":
+        return _emit_platform_conv()
+    return _emit_platform_listing(generator, weight_data)
+
+
+def _emit_platform_listing(generator, weight_data: bytes) -> str:
+    """Fixed-shape platform-standard listing (B-1).
+
+    Differences from the default debug listing:
+      - global entry symbol ``cnn_entry`` (not ``_start``);
+      - branch/jump targets are real labels (not numeric offsets);
+      - the ``_init_data_base`` placeholder pair becomes ``la gp, __data_start``;
+      - weights/constants are emitted inline as ``.word`` in a ``.data`` section
+        (no ``.incbin`` / ``.include``), preceded by ``__data_start``.
+
+    Platform contract: a0 = input base, a1 = output base, a2 = size scalar;
+    sp is already set by the caller.
+    """
+    import re as _re
+
+    emit = generator.emit
+    dis = emit.disassemble(symbolic=True).splitlines()
+
+    # Prefer the emitter's own label names; else a generated .Lpc_<idx>.
+    idx_to_name: dict[int, str] = {}
+    for name, idx in emit.labels.items():
+        if idx not in idx_to_name:
+            idx_to_name[idx] = name
+
+    def label_for(idx: int) -> str:
+        if idx == 0:
+            return "cnn_entry"
+        return idx_to_name.get(idx, f".Lpc_{idx}")
+
+    out: list[str] = []
+    for line in dis:
+        stripped = line.strip()
+        if stripped.endswith(":") and stripped[:-1].startswith(".Lsv_"):
+            idx = int(stripped[len(".Lsv_"):-1])
+            out.append(f"{label_for(idx)}:")
+        else:
+            out.append(_re.sub(r"\.Lsv_(\d+)", lambda m: label_for(int(m.group(1))), line))
+
+    # Replace the auipc/addi placeholder pair with a standard la.
+    fixed: list[str] = []
+    skip_next = False
+    for line in out:
+        if skip_next:
+            skip_next = False
+            continue
+        if "auipc gp, 0x0" in line:
+            indent = line[: len(line) - len(line.lstrip())]
+            fixed.append(f"{indent}la gp, __data_start      # data section base")
+            skip_next = True  # drop the following addi/mv placeholder
+            continue
+        fixed.append(line)
+
+    header = [
+        "# Generated by ScratchV standalone --platform-asm",
+        "# Platform contract: a0=input base, a1=output base, a2=size; sp preset.",
+        "# Assemble: clang -march=rv32im -mabi=ilp32 -nostdlib -c this.s",
+        "",
+        "    .option norelax",
+        "    .text",
+        "    .globl cnn_entry",
+        "    .type cnn_entry, @function",
+    ]
+    tail = ["    .size cnn_entry, . - cnn_entry", ""]
+
+    data_lines = ["", "    .data", "    .balign 4", "__data_start:"]
+    if weight_data:
+        words = struct.unpack(f"<{len(weight_data) // 4}I", weight_data)
+        for i in range(0, len(words), 8):
+            chunk = ", ".join(f"0x{w:08x}" for w in words[i:i + 8])
+            data_lines.append(f"    .word {chunk}")
+    else:
+        data_lines.append("    .word 0")
+
+    return "\n".join(header + fixed + tail + data_lines) + "\n"
+
+
 def patch_gp_data_base(
     generator: CNNRISCVGenerator,
     code_bytes: bytes,
@@ -3395,6 +3743,7 @@ def convert_onnx_to_riscv(
     metadata: dict | None = None,
     llvm_mca: str | None = None,
     symbolic_asm: bool = False,
+    platform_asm: bool = False,
 ) -> int:
     """Full pipeline: ONNX model → RISC-V RV32IM binary.
 
@@ -3590,7 +3939,10 @@ def convert_onnx_to_riscv(
     print(f"  Binary: {output_bin} ({len(binary):,} bytes)")
 
     # Disassembly for verification
-    asm_text = generator.emit.disassemble(symbolic=schedule or symbolic_asm)
+    if platform_asm:
+        asm_text = emit_platform_asm(generator, weight_data, model)
+    else:
+        asm_text = generator.emit.disassemble(symbolic=schedule or symbolic_asm)
     asm_path = output_asm or output_bin.replace(".bin", ".s")
     with open(asm_path, "w") as f:
         f.write(asm_text)
@@ -3777,6 +4129,10 @@ def main() -> int:
                         help="Schedule physical-register instructions before writing the binary")
     parser.add_argument("--symbolic-asm", action="store_true",
                         help="Emit reassemblable symbolic targets for scheduling analysis")
+    parser.add_argument("--platform-asm", action="store_true",
+                        help="Emit platform-standard assembly: global entry cnn_entry, "
+                             "label branch targets, inline .word weights, la gp (clang-"
+                             "assemblable, -march=rv32im -nostdlib)")
     parser.add_argument(
         "--uarch", default="basic", choices=["single", "fast", "basic", "slow"],
         help="Microarchitecture profile for cycle-accurate emulation: "
@@ -3818,6 +4174,7 @@ def main() -> int:
         const_merge=args.const_merge,
         schedule=args.schedule,
         symbolic_asm=args.symbolic_asm,
+        platform_asm=args.platform_asm,
     )
 
 
