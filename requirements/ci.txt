@@ -1,0 +1,15 @@
+# CI / verification environment
+# Target Python: 3.11 - 3.12 (the bundled Python 3.8 .venv is broken; do not use)
+# CI and local runs use this file. Install:
+#     python3.11 -m venv .venv311 && source .venv311/bin/activate
+#     pip install -r requirements/ci.txt
+#     pip install -e ".[all]"        # optional: tinyfive / llvmlite / onnxruntime
+
+numpy>=1.26,<3
+onnx>=1.14,<2
+protobuf>=4.21
+pytest>=7
+
+# Optional (accelerators / independent verification): uncomment to use
+# onnxruntime
+# llvmlite
