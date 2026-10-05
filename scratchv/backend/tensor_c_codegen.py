@@ -33,6 +33,21 @@ _TYPES = {DataType.FLOAT32: ("float", np.dtype("float32")),
           DataType.INT32: ("int32_t", np.dtype("int32")),
           DataType.INT64: ("int64_t", np.dtype("int64"))}
 
+# Winograd F(2,3) transforms; values match standalone _WINO_F23_BT/_WINO_F23_AT.
+_WINO_F23_BT = ((1, 0, -1, 0), (0, 1, 1, 0), (0, -1, 1, 0), (0, 1, 0, -1))
+_WINO_F23_AT = ((1.0, 1.0, 1.0, 0.0), (0.0, 1.0, -1.0, -1.0))
+
+
+def _sum_terms(terms):
+    """Render signed {0,±1} terms as a C sum expression."""
+    expression = ""
+    for coefficient, text in terms:
+        if coefficient > 0:
+            expression += (" + " if expression else "") + text
+        else:
+            expression += (" - " + text) if expression else ("-" + text)
+    return expression or "0.0f"
+
 
 @dataclass(frozen=True)
 class TensorSpec:
@@ -184,6 +199,8 @@ class TensorCCodegen:
                 raise TensorCCodegenError("Memory limits must be nonnegative integers")
         self.specs, self.names, self.constants, self.body = {}, {}, [], []
         self.constant_bytes = 0
+        self.extra_workspace = 0
+        self._winograd_declared = False
         self._counter = 0
         defined = set()
         for value in [*self.program.global_values, *func.params]:
@@ -283,12 +300,16 @@ class TensorCCodegen:
         self.body += ["if (!output) return 1;",
                       f"for (size_t i=0; i<{output.size}ULL; ++i) (({ctype} *)output)[i] = {self.names[output.name]}[i];",
                       "return 0;"]
+        workspace_total = high + self.extra_workspace
+        if workspace_total > self.max_workspace_bytes:
+            raise TensorCCodegenError(
+                f"Static workspace exceeds {self.max_workspace_bytes} bytes")
         source = (_PRELUDE + "\n" + "\n".join(self.constants)
                   + f"\nstatic union {{ uint64_t align; unsigned char bytes[{max(high, 8)}]; }} sv_arena;\n"
                   + "#if defined(_WIN32)\n__declspec(dllexport)\n#endif\n"
                   + "int scratchv_run(const void *const inputs[], void *output) {\n  "
                   + "\n  ".join(self.body) + "\n}\n")
-        return TensorCArtifact(source, inputs, output, high, self.constant_bytes)
+        return TensorCArtifact(source, inputs, output, workspace_total, self.constant_bytes)
 
     def _register(self, value, shape=None):
         if value.dtype not in _TYPES:
@@ -335,6 +356,15 @@ class TensorCCodegen:
         if op == OpCode.CONCAT:
             if not xs:
                 raise TensorCCodegenError("Concat needs at least one input")
+        elif op == OpCode.FWHT:
+            if len(xs) != 1:
+                raise TensorCCodegenError("FWHT needs 1 operand")
+        elif op == OpCode.SPMM_CSR:
+            if len(xs) != 4:
+                raise TensorCCodegenError("SPMM_CSR needs 4 operands")
+        elif op == OpCode.WINOGRAD_CONV:
+            if len(xs) not in (2, 3):
+                raise TensorCCodegenError("WinogradConv needs 2 or 3 operands")
         elif len(xs) != expected_count:
             raise TensorCCodegenError(f"Expected {expected_count} operands")
         if op != OpCode.CAST and dtype != xs[0].dtype:
@@ -435,6 +465,44 @@ class TensorCCodegen:
             return tuple(1 if a in axes else next(dims) for a in range(rank)), {}
         if op == OpCode.EXPAND:
             return _broadcast(x.shape, tuple(attrs["shape"])), {}
+        if op == OpCode.FWHT:
+            if dtype != DataType.FLOAT32:
+                raise TensorCCodegenError("FWHT tensor-c lowering supports FP32")
+            count = xs[0].size
+            if count <= 0 or (count & (count - 1)):
+                raise TensorCCodegenError("FWHT requires a power-of-two element count")
+            direction = attrs.get("direction", "forward")
+            if direction not in ("forward", "inverse"):
+                raise TensorCCodegenError("FWHT direction must be forward/inverse")
+            return xs[0].shape, dict(n=count, direction=direction)
+        if op == OpCode.SPMM_CSR:
+            if dtype != DataType.FLOAT32:
+                raise TensorCCodegenError("SPMM_CSR tensor-c lowering supports FP32")
+            values, col, rowptr, b = xs
+            if values.shape != col.shape:
+                raise TensorCCodegenError("SPMM_CSR values/col length mismatch")
+            indices = (DataType.INT32, DataType.INT64)
+            if col.dtype not in indices or rowptr.dtype not in indices:
+                raise TensorCCodegenError("SPMM_CSR col/rowptr must be integer")
+            if values.dtype != b.dtype:
+                raise TensorCCodegenError("SPMM_CSR values and B must share a dtype")
+            m, k = rowptr.size - 1, b.shape[0]
+            n = b.shape[1] if len(b.shape) >= 2 else 1
+            return (m, n), dict(m=m, n=n, k=k)
+        if op == OpCode.WINOGRAD_CONV:
+            if dtype != DataType.FLOAT32:
+                raise TensorCCodegenError("WINOGRAD_CONV tensor-c lowering supports FP32")
+            data, weight = xs[0], xs[1]
+            if (len(data.shape) != 4 or len(weight.shape) != 4
+                    or tuple(weight.shape[2:]) != (4, 4)):
+                raise TensorCCodegenError(
+                    "WinogradConv expects NCHW x and [Cout,Cin,4,4] U")
+            if data.shape[1] != weight.shape[1]:
+                raise TensorCCodegenError("WinogradConv Cin disagrees between x and U")
+            batch, cin, height, width = data.shape
+            cout = weight.shape[0]
+            return (batch, cout, height, width), dict(
+                N=batch, cin=cin, H=height, W=width, cout=cout)
         raise TensorCCodegenError(f"Unsupported tensor opcode: {op.value}")
 
     def _emit(self, instruction, output, details):
@@ -449,7 +517,89 @@ class TensorCCodegen:
             dimension = xs[0].shape[details["axis"]]
             self.body.append(f"for (size_t j=0; j<{xs[1].size}ULL; ++j) if ({names[1]}[j]<-{dimension}LL "
                              f"|| {names[1]}[j]>={dimension}LL) return 3;")
+        if op == OpCode.SPMM_CSR:
+            # Column indices must address B even when the output is empty.
+            self.body.append(f"for (size_t j=0;j<{xs[1].size}ULL;++j) "
+                             f"if ({names[1]}[j]<0 || {names[1]}[j]>={details['k']}LL) return 4;")
         if not size:
+            return
+        if op == OpCode.SPMM_CSR:
+            m, n = details["m"], details["n"]
+            nnz = xs[1].size
+            self.body.append(
+                f"for (size_t i=0;i<{m}ULL;++i) {{ int64_t s={names[2]}[i], e={names[2]}[i+1];"
+                f" if (s<0||e<s||e>{nnz}LL) return 4;"
+                f" for (size_t c=0;c<{n}ULL;++c) {dst}[i*{n}ULL+c]=0.0f;"
+                f" for (int64_t j=s;j<e;++j) {{ float a={names[0]}[j]; int64_t kk={names[1]}[j];"
+                f" for (size_t c=0;c<{n}ULL;++c) {dst}[i*{n}ULL+c]+=a*{names[3]}[kk*{n}ULL+c]; }} }}")
+            return
+        if op == OpCode.FWHT:
+            n = details["n"]
+            self.body.append(f"for (size_t i=0;i<{n}ULL;++i) {dst}[i]={names[0]}[i];")
+            self.body.append(
+                f"for (size_t L=1;L<{n}ULL;L<<=1) for (size_t base=0;base<{n}ULL;base+=2*L)"
+                f" for (size_t j=0;j<L;++j) {{ float u={dst}[base+j], v={dst}[base+j+L];"
+                f" {dst}[base+j]=u+v; {dst}[base+j+L]=u-v; }}")
+            if details["direction"] == "inverse":
+                self.body.append(
+                    f"for (size_t i=0;i<{n}ULL;++i) {dst}[i]/="
+                    f"{_literal(float(n), DataType.FLOAT32)};")
+            return
+        if op == OpCode.WINOGRAD_CONV:
+            if not self._winograd_declared:
+                self.body.append("static float sv_wg_d[16], sv_wg_v[16], sv_wg_acc[16];")
+                self._winograd_declared = True
+                self.extra_workspace += 3 * 16 * 4
+            batch, cin, height, width, cout = (
+                details["N"], details["cin"], details["H"], details["W"], details["cout"])
+            tiles_h, tiles_w = (height + 1) // 2, (width + 1) // 2
+            src, weight = names[0], names[1]
+            bias = names[2] if len(xs) == 3 else None
+            code = [
+                f"for (size_t n=0;n<{batch}ULL;++n) {{",
+                f" for (size_t oc=0;oc<{cout}ULL;++oc) {{",
+                f"  for (size_t ti=0;ti<{tiles_h}ULL;++ti) {{",
+                f"   for (size_t tj=0;tj<{tiles_w}ULL;++tj) {{",
+                "    for (int p=0;p<16;++p) sv_wg_acc[p]=0.0f;",
+                f"    for (size_t ic=0;ic<{cin}ULL;++ic) {{",
+            ]
+            for r in range(4):
+                for c in range(4):
+                    code.append(
+                        f"     {{ int gi=(int)(2*ti)-1+{r}, gj=(int)(2*tj)-1+{c}; float v=0.0f;"
+                        f" if (gi>=0 && gi<{height} && gj>=0 && gj<{width})"
+                        f" v={src}[((n*{cin}ULL+ic)*{height}ULL+gi)*{width}ULL+gj];"
+                        f" sv_wg_d[{r * 4 + c}]=v; }}")
+            for a in range(4):
+                for bb in range(4):
+                    terms = []
+                    for m in range(4):
+                        for j in range(4):
+                            coef = _WINO_F23_BT[a][m] * _WINO_F23_BT[bb][j]
+                            if coef:
+                                terms.append((coef, f"sv_wg_d[{m * 4 + j}]"))
+                    code.append(f"     sv_wg_v[{a * 4 + bb}]={_sum_terms(terms)};")
+            for p in range(16):
+                code.append(
+                    f"     sv_wg_acc[{p}]+={weight}[((oc*{cin}ULL+ic)*16ULL)+{p}]*sv_wg_v[{p}];")
+            code.append("    }")
+            for oy in range(2):
+                for ox in range(2):
+                    terms = []
+                    for a in range(4):
+                        for bb in range(4):
+                            coef = _WINO_F23_AT[oy][a] * _WINO_F23_AT[ox][bb]
+                            if coef:
+                                terms.append((coef, f"sv_wg_acc[{a * 4 + bb}]"))
+                    expression = _sum_terms(terms)
+                    if bias is not None:
+                        expression += f" + {bias}[oc]"
+                    oh, ow = f"2*ti+{oy}", f"2*tj+{ox}"
+                    code.append(
+                        f"    if ({oh}<{height}ULL && {ow}<{width}ULL)"
+                        f" {dst}[((n*{cout}ULL+oc)*{height}ULL+({oh}))*{width}ULL+({ow})]={expression};")
+            code += ["   }", "  }", " }", "}"]
+            self.body.append("\n".join(code))
             return
         if op == OpCode.LOAD_CONST:
             self.body.append(f"{dst}[0] = {_literal(attrs['value'], dtype)};")

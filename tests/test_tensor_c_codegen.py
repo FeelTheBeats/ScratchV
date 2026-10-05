@@ -21,6 +21,8 @@ from scratchv.backend.tensor_c_codegen import TensorCCodegen, TensorCCodegenErro
 from scratchv.frontend.onnx_parser import ONNXParser
 from scratchv.ir.builder import IRBuilder
 from scratchv.ir.types import DataType as D, OpCode, Value
+from scratchv.standalone.onnx_to_riscv_standalone import winograd_f23_kernel_transform
+from tests._op_ref import conv_direct_ref_f32, fwht_forward_f32, spmm_ref_f32
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -330,3 +332,207 @@ def test_same_generator_is_reusable_and_never_mutates_ir():
     first, second = generator.generate(), generator.generate()
     assert first == second
     assert b.program.dump() == before
+
+
+# ── standalone-verified operators (FP32 tensor-c lowering) ─────────────────
+
+def _global(b, name, dtype, shape):
+    value = Value(name, dtype, shape=shape)
+    b.program.global_values.append(value)
+    return value
+
+
+def test_tensor_c_fwht(tmp_path, compiler):
+    n = 64
+    x = Value("x", D.FLOAT32, shape=(1, n))
+    b = builder(x)
+    b.ret(b.fwht(x))
+    artifact = TensorCCodegen(b.program).generate()
+    rng = np.random.default_rng(0)
+    feed = {"x": rng.uniform(-1.0, 1.0, (1, n)).astype(np.float32)}
+    with compiled(tmp_path, artifact, compiler) as execute:
+        status, result = execute(feed)
+    assert status == 0
+    np.testing.assert_allclose(result.reshape(-1), fwht_forward_f32(feed["x"].reshape(-1)),
+                               atol=1e-6, rtol=1e-6)
+
+
+def test_tensor_c_fwht_inverse(tmp_path, compiler):
+    n = 32
+    x = Value("x", D.FLOAT32, shape=(n,))
+    b = builder(x)
+    b.ret(b.fwht(x, direction="inverse"))
+    artifact = TensorCCodegen(b.program).generate()
+    rng = np.random.default_rng(1)
+    feed = {"x": rng.uniform(-1.0, 1.0, (n,)).astype(np.float32)}
+    forward = fwht_forward_f32(feed["x"])
+    with compiled(tmp_path, artifact, compiler) as execute:
+        status, result = execute(feed)
+    assert status == 0
+    # inverse = forward Hadamard then scale 1/N.
+    np.testing.assert_allclose(result, forward / np.float32(n), atol=1e-6, rtol=1e-6)
+
+
+def test_tensor_c_spmm(tmp_path, compiler):
+    m, k, n = 4, 6, 3
+    rowptr = np.array([0, 2, 2, 3, 4], np.int32)
+    col = np.array([0, 2, 1, 3], np.int32)
+    values = np.array([0.25, -0.5, 0.75, 0.125], np.float32)
+    b_spec = Value("B", D.FLOAT32, shape=(k, n))
+    b = builder(b_spec)
+    values_v = _global(b, "values", D.FLOAT32, (values.size,))
+    col_v = _global(b, "col", D.INT32, (col.size,))
+    row_v = _global(b, "rowptr", D.INT32, (rowptr.size,))
+    b.ret(b.spmm_csr(values_v, col_v, row_v, b_spec))
+    artifact = TensorCCodegen(b.program, {"values": values, "col": col, "rowptr": rowptr}).generate()
+    rng = np.random.default_rng(3)
+    feed = {"B": rng.uniform(-0.4, 0.4, (k, n)).astype(np.float32)}
+    with compiled(tmp_path, artifact, compiler) as execute:
+        status, result = execute(feed)
+    assert status == 0
+    np.testing.assert_allclose(result, spmm_ref_f32(values, col, rowptr, feed["B"], m, n),
+                               atol=1e-6, rtol=1e-6)
+
+
+def test_tensor_c_spmm_out_of_range_returns_status_and_recovers(tmp_path, compiler):
+    m, k, n = 1, 2, 1
+    b_spec = Value("B", D.FLOAT32, shape=(k, n))
+    b = builder(b_spec)
+    values_v = _global(b, "values", D.FLOAT32, (1,))
+    col_v = _global(b, "col", D.INT32, (1,))
+    row_v = _global(b, "rowptr", D.INT32, (2,))
+    b.ret(b.spmm_csr(values_v, col_v, row_v, b_spec))
+    artifact = TensorCCodegen(b.program, {
+        "values": np.array([1.0], np.float32),
+        "col": np.array([5], np.int32),   # 5 >= K -> out of range
+        "rowptr": np.array([0, 1], np.int32),
+    }).generate()
+    with compiled(tmp_path, artifact, compiler) as execute:
+        status, _ = execute({"B": np.ones((k, n), np.float32)})
+        assert status == 4
+
+
+def test_tensor_c_winograd(tmp_path, compiler):
+    cin, cout, h, w = 3, 4, 8, 8
+    rng = np.random.default_rng(2)
+    weight = rng.normal(0, 0.3, (cout, cin, 3, 3)).astype(np.float32)
+    u = np.empty((cout, cin, 4, 4), np.float32)
+    for oc in range(cout):
+        for ic in range(cin):
+            u[oc, ic] = np.asarray(
+                winograd_f23_kernel_transform(weight[oc, ic].tolist()), np.float32)
+    x = Value("x", D.FLOAT32, shape=(1, cin, h, w))
+    b = builder(x)
+    u_v = _global(b, "u", D.FLOAT32, (cout, cin, 4, 4))
+    b.ret(b.winograd_conv(x, u_v, cout=cout, cin=cin))
+    artifact = TensorCCodegen(b.program, {"u": u}).generate()
+    feed = {"x": rng.uniform(-0.25, 0.25, (1, cin, h, w)).astype(np.float32)}
+    with compiled(tmp_path, artifact, compiler) as execute:
+        status, result = execute(feed)
+    assert status == 0
+    np.testing.assert_allclose(result, conv_direct_ref_f32(feed["x"], weight, 1),
+                               rtol=1e-4, atol=1e-4)
+
+
+def test_tensor_c_winograd_uses_tracked_scratch():
+    x = Value("x", D.FLOAT32, shape=(1, 2, 8, 8))
+    b = builder(x)
+    u_v = _global(b, "u", D.FLOAT32, (3, 2, 4, 4))
+    b.ret(b.winograd_conv(x, u_v, cout=3, cin=2))
+    artifact = TensorCCodegen(b.program, {"u": np.zeros((3, 2, 4, 4), np.float32)}).generate()
+    assert "static float sv_wg_d[16]" in artifact.source
+    assert artifact.workspace_bytes >= 3 * 16 * 4
+
+
+@pytest.mark.parametrize("kind", ["fwht_int32", "fwht_nonpow2", "spmm_len", "spmm_index",
+                                  "wino_int32", "wino_cin"])
+def test_tensor_c_rejects_static_graphs(kind):
+    bindings = {}
+    if kind == "fwht_int32":
+        x = Value("x", D.INT32, shape=(16,))
+        b = builder(x)
+        b.ret(b.fwht(x))
+    elif kind == "fwht_nonpow2":
+        x = Value("x", D.FLOAT32, shape=(48,))
+        b = builder(x)
+        b.ret(b.fwht(x))
+    elif kind == "spmm_len":
+        b_spec = Value("B", D.FLOAT32, shape=(4, 1))
+        b = builder(b_spec)
+        values_v = _global(b, "values", D.FLOAT32, (2,))
+        col_v = _global(b, "col", D.INT32, (3,))
+        row_v = _global(b, "rowptr", D.INT32, (3,))
+        b.ret(b.spmm_csr(values_v, col_v, row_v, b_spec))
+        bindings = {"values": np.zeros(2, np.float32), "col": np.zeros(3, np.int32),
+                    "rowptr": np.zeros(3, np.int32)}
+    elif kind == "spmm_index":
+        b_spec = Value("B", D.FLOAT32, shape=(4, 1))
+        b = builder(b_spec)
+        values_v = _global(b, "values", D.FLOAT32, (1,))
+        col_v = _global(b, "col", D.FLOAT32, (1,))
+        row_v = _global(b, "rowptr", D.INT32, (2,))
+        b.ret(b.spmm_csr(values_v, col_v, row_v, b_spec))
+        bindings = {"values": np.zeros(1, np.float32), "col": np.zeros(1, np.float32),
+                    "rowptr": np.zeros(2, np.int32)}
+    elif kind == "wino_int32":
+        x = Value("x", D.INT32, shape=(1, 2, 8, 8))
+        b = builder(x)
+        u_v = _global(b, "u", D.INT32, (3, 2, 4, 4))
+        b.ret(b.winograd_conv(x, u_v, cout=3, cin=2))
+        bindings = {"u": np.zeros((3, 2, 4, 4), np.int32)}
+    else:  # wino_cin
+        x = Value("x", D.FLOAT32, shape=(1, 2, 8, 8))
+        b = builder(x)
+        u_v = _global(b, "u", D.FLOAT32, (3, 3, 4, 4))
+        b.ret(b.winograd_conv(x, u_v, cout=3, cin=2))
+        bindings = {"u": np.zeros((3, 3, 4, 4), np.float32)}
+    with pytest.raises(TensorCCodegenError):
+        TensorCCodegen(b.program, bindings).generate()
+
+
+def test_tensor_c_driver_end_to_end(tmp_path, compiler):
+    import onnx
+    from onnx import TensorProto, helper
+
+    from scratchv.compiler import CompilerConfig, CompilerDriver
+
+    n, cin, h, w, cout = 64, 3, 8, 8, 4
+    fwht = helper.make_model(helper.make_graph(
+        [helper.make_node("Fwht", ["X"], ["Y"], domain="org.scratchv", direction="forward")],
+        "fwht",
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, n])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, n])],
+    ), opset_imports=[helper.make_opsetid("org.scratchv", 1), helper.make_opsetid("", 13)])
+
+    rng = np.random.default_rng(9)
+    weight = rng.normal(0, 0.3, (cout, cin, 3, 3)).astype(np.float32)
+    wino = helper.make_model(helper.make_graph(
+        [helper.make_node("WinogradConv", ["x", "w"], ["y"],
+                          domain="org.scratchv", pads=[1, 1, 1, 1])],
+        "wino",
+        [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, cin, h, w])],
+        [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, cout, h, w])],
+        [helper.make_tensor("w", TensorProto.FLOAT, list(weight.shape), weight.ravel().tolist())],
+    ), opset_imports=[helper.make_opsetid("org.scratchv", 1), helper.make_opsetid("", 13)])
+
+    cases = [
+        ("fwht", fwht, {"X": rng.uniform(-1, 1, (1, n)).astype(np.float32)},
+         lambda f: fwht_forward_f32(f["X"].reshape(-1)).reshape(1, n), 1e-6),
+        ("wino", wino, {"x": rng.uniform(-0.25, 0.25, (1, cin, h, w)).astype(np.float32)},
+         lambda f: conv_direct_ref_f32(f["x"], weight, 1), 1e-4),
+    ]
+    for name, model, feed, reference, atol in cases:
+        case_dir = tmp_path / name
+        case_dir.mkdir()
+        path = case_dir / f"{name}.onnx"
+        onnx.save(model, path)
+        driver = CompilerDriver(CompilerConfig(backend="tensor-c"))
+        output = case_dir / f"{name}.c"
+        result = driver.compile(str(path), str(output))
+        assert result.success, result.errors
+        artifact = driver.tensor_artifact
+        # Distinct per-case directories avoid dlopen caching the previous .so.
+        with compiled(case_dir, artifact, compiler) as execute:
+            status, actual = execute(feed)
+        assert status == 0
+        np.testing.assert_allclose(actual, reference(feed), rtol=atol, atol=atol)
