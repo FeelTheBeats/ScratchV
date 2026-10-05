@@ -154,6 +154,7 @@ def _safe_decode(b: object) -> str:
 
 # ONNX data type constants
 ONNX_FLOAT = 1
+ONNX_INT32 = 6
 ONNX_INT64 = 7
 
 
@@ -394,6 +395,25 @@ class ONNXModel:
                         arr.append(struct.pack("<f", v))
                 tensor.data = b"".join(arr)
 
+        # int32_data (field 5, packed — fallback for INT32 tensors)
+        # Negative int32 values are encoded as sign-extended varints; wrap them
+        # back to 32-bit two's complement before packing.
+        if not tensor.data and 5 in f and tensor.data_type == ONNX_INT32:
+            d5 = f[5]
+            if isinstance(d5, bytes):
+                vals = _parse_packed_varints(d5)
+            elif isinstance(d5, list):
+                vals = [int(v) if isinstance(v, int) else 0 for v in d5]
+            else:
+                vals = []
+            out = []
+            for v in vals:
+                u = v & 0xFFFFFFFF
+                if u >= 0x80000000:
+                    u -= 0x100000000
+                out.append(struct.pack("<i", u))
+            tensor.data = b"".join(out)
+
         # int64_data (field 7, packed — fallback for INT64 tensors)
         if not tensor.data and 7 in f:
             id7 = f[7]
@@ -428,6 +448,8 @@ class ONNXModel:
                 raw_size = len(fields[9])
                 if data_type == ONNX_FLOAT and raw_size == n * 4:
                     return (n,)
+                if data_type == ONNX_INT32 and raw_size == n * 4:
+                    return (n,)
                 if data_type == ONNX_INT64 and raw_size == n * 8:
                     return (n,)
             return (n,)
@@ -438,6 +460,8 @@ class ONNXModel:
         if 9 in fields and isinstance(fields[9], bytes):
             raw_size = len(fields[9])
             if data_type == ONNX_FLOAT:
+                return (raw_size // 4,)
+            if data_type == ONNX_INT32:
                 return (raw_size // 4,)
             if data_type == ONNX_INT64:
                 return (raw_size // 8,)
@@ -529,6 +553,13 @@ class ONNXModel:
                 self._set_output_shape(node, input_shapes[0])
         elif op == "Reshape":
             self._infer_reshape_shape(node, input_shapes)
+        elif op == "Fwht":
+            if input_shapes and input_shapes[0]:
+                self._set_output_shape(node, input_shapes[0])
+        elif op == "SpmmCsr":
+            self._infer_spmm_shape(node, input_shapes)
+        elif op == "WinogradConv":
+            self._infer_conv_shape(node, input_shapes)
 
     def _infer_conv_shape(
         self, node: NodeInfo, shapes: list[tuple[int, ...]]
@@ -541,11 +572,18 @@ class ONNXModel:
 
         out_channels = w_shape[0] if len(w_shape) >= 1 else 1
 
-        kernel = node.attrs.get("kernel_shape", [3, 3])
-        if isinstance(kernel, list) and len(kernel) >= 2:
-            kh, kw = int(kernel[0]), int(kernel[1])
+        # Prefer the actual weight kernel dims over the kernel_shape attr /
+        # default 3, otherwise non-3x3 kernels (e.g. 5x5) are mis-sized.
+        if len(w_shape) >= 4 and w_shape[2] > 0 and w_shape[3] > 0:
+            kh, kw = int(w_shape[2]), int(w_shape[3])
+        elif len(w_shape) >= 3 and w_shape[2] > 0:
+            kh = kw = int(w_shape[2])
         else:
-            kh = kw = 3
+            kernel = node.attrs.get("kernel_shape", [3, 3])
+            if isinstance(kernel, list) and len(kernel) >= 2:
+                kh, kw = int(kernel[0]), int(kernel[1])
+            else:
+                kh = kw = 3
 
         stride = node.attrs.get("strides", [1, 1])
         if isinstance(stride, list) and len(stride) >= 2:
@@ -662,6 +700,22 @@ class ONNXModel:
         # Fallback: if second input shape is known and >0 dims, use it
         if len(shapes) >= 2 and shapes[1]:
             self._set_output_shape(node, shapes[1])
+
+    def _infer_spmm_shape(
+        self, node: NodeInfo, shapes: list[tuple[int, ...]]
+    ) -> None:
+        """Infer SpmmCsr output (M, N) from row_ptr length and dense B shape.
+
+        Inputs: (values, col_indices, row_ptr, B); M = len(row_ptr) - 1,
+        N = B.shape[1] (or 1 for a 1-D B / SpMV).
+        """
+        if len(shapes) < 4 or not shapes[3]:
+            return
+        row_shape = shapes[2]
+        m = (row_shape[0] - 1) if row_shape else 0
+        b_shape = shapes[3]
+        n = b_shape[1] if len(b_shape) >= 2 else 1
+        self._set_output_shape(node, (m, n))
 
     def _set_output_shape(
         self, node: NodeInfo, shape: tuple[int, ...]
@@ -1068,6 +1122,64 @@ def int64_to_shape(raw_bytes: bytes) -> tuple[int, ...]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Winograd F(2,3) transforms (compile-time helpers, pure Python)
+# ═══════════════════════════════════════════════════════════════════════════
+# 2D minimal filtering: Y = A^T [ (G g G^T) ⊙ (B^T d B) ] A
+# F(2,3): input tile 4x4, kernel 3x3, output 2x2.
+# G contains 1/2 entries; B^T and A^T are integer {0, ±1}.
+
+_WINO_F23_BT = ((1, 0, -1, 0), (0, 1, 1, 0), (0, -1, 1, 0), (0, 1, 0, -1))
+_WINO_F23_G = ((1.0, 0.0, 0.0), (0.5, 0.5, 0.5),
+               (0.5, -0.5, 0.5), (0.0, 0.0, 1.0))
+_WINO_F23_AT = ((1.0, 1.0, 1.0, 0.0), (0.0, 1.0, -1.0, -1.0))
+
+
+def winograd_f23_kernel_transform(g):
+    """Return U = G g G^T (4x4) for a 3x3 kernel g (nested sequences)."""
+    P = [[sum(_WINO_F23_G[i][k] * g[k][j] for k in range(3)) for j in range(3)]
+         for i in range(4)]
+    return [[sum(P[i][k] * _WINO_F23_G[j][k] for k in range(3)) for j in range(4)]
+            for i in range(4)]
+
+
+def _prepare_winograd_kernels(model) -> None:
+    """Fold WinogradConv 3x3 kernels into the Winograd domain at compile time.
+
+    For each WinogradConv node with FLOAT weight [Cout, Cin, 3, 3], compute
+    U = [Cout, Cin, 4, 4] and register it as a new FLOAT initializer. The node
+    stores the tensor name in ``attrs["_winograd_u"]`` for the code generator.
+    """
+    for node in model.nodes:
+        if node.op_type != "WinogradConv" or len(node.inputs) < 2:
+            continue
+        w = model.initializers.get(node.inputs[1])
+        if w is None or not w.data or len(w.shape) != 4:
+            continue
+        cout, cin, kh, kw = w.shape
+        if (kh, kw) != (3, 3):
+            raise ValueError("WinogradConv currently supports 3x3 kernels only")
+
+        floats = struct.unpack(f"<{cout * cin * 9}f", w.data)
+        u_bytes = bytearray()
+        for oc in range(cout):
+            for ic in range(cin):
+                base = (oc * cin + ic) * 9
+                g = [[floats[base + r * 3 + c] for c in range(3)] for r in range(3)]
+                u = winograd_f23_kernel_transform(g)
+                for r in range(4):
+                    for c in range(4):
+                        u_bytes += struct.pack("<f", u[r][c])
+
+        tensor = TensorInfo()
+        tensor.name = f"{w.name}__wino23"
+        tensor.shape = (cout, cin, 4, 4)
+        tensor.data_type = ONNX_FLOAT
+        tensor.data = bytes(u_bytes)
+        model.initializers[tensor.name] = tensor
+        node.attrs["_winograd_u"] = tensor.name
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Part 5: Memory Planner
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -1108,6 +1220,13 @@ class MemoryPlan:
             # Convert to Q16.16
             if tensor.data_type == ONNX_FLOAT:
                 q16_vals = float32_to_q16(tensor.data)
+            elif tensor.data_type == ONNX_INT32:
+                # INT32 tensors (e.g. CSR col_indices / row_ptr) are stored
+                # verbatim as one 32-bit word per element — do NOT run them
+                # through the Q16.16 conversion.
+                n = len(tensor.data) // 4
+                int_vals = struct.unpack(f"<{n}i", tensor.data)
+                q16_vals = [v & 0xFFFFFFFF for v in int_vals]
             elif tensor.data_type == ONNX_INT64:
                 # INT64 tensors (like Reshape target shapes) — keep as-is
                 q16_vals = []
@@ -1695,7 +1814,8 @@ class CNNRISCVGenerator:
         """
         x_name = node.inputs[0]
         w_name = node.inputs[1]
-        b_name = node.inputs[2]
+        # Conv bias is optional; a missing third input means "no bias" (zero).
+        b_name = node.inputs[2] if len(node.inputs) > 2 and node.inputs[2] else None
         out_name = node.outputs[0]
 
         x_shape = self.model.get_shape(x_name)
@@ -1730,7 +1850,8 @@ class CNNRISCVGenerator:
         # Load base addresses
         self._get_workspace_addr(x_name, self.S2)   # s2 = input base
         self._get_weight_addr(w_name, self.S3)       # s3 = weight base
-        self._get_weight_addr(b_name, self.S4)       # s4 = bias base
+        if b_name is not None:
+            self._get_weight_addr(b_name, self.S4)   # s4 = bias base
         self._get_workspace_addr(out_name, self.S5)  # s5 = output base
 
         # ── Preload loop-invariant constants ──────────────────────────
@@ -1782,336 +1903,366 @@ class CNNRISCVGenerator:
         K_K = K * K
         W_minus_K_times_4 = (W - K) * 4
 
-        # ── oc loop ────────────────────────────────────────────────────
-        self.emit.emit(rv_addi(OC_REG, _R_ZERO, 0), f"oc=0 (C_out={C_out})")
-        L("_conv_oc_loop")
+        # Batch (N) is handled by emitting the whole computation N times with a
+        # compile-time slice offset, rather than a runtime loop: N is known at
+        # codegen time and is small (<= a few). N==1 emits exactly the old code.
+        in_batch_stride = C_in * H * W
+        out_batch_stride = C_out * H_out * W_out
 
-        # ── oh loop ────────────────────────────────────────────────────
-        self.emit.emit(rv_addi(OH_REG, _R_ZERO, 0), f"oh=0 (H_out={H_out})")
-        L("_conv_oh_loop")
+        for _n in range(N):
+            # Unique label prefix per batch copy (labels repeat across copies).
+            previous_prefix = self.emit.label_prefix
+            self.emit.label_prefix = f"{previous_prefix}n{_n}_"
+            if _n > 0:
+                # Advance both working bases by one sample stride. Bases carry
+                # over between copies, so add an incremental stride (not n*).
+                self.emit.emit_li32(TMP_REG, in_batch_stride,
+                                    f"batch n={_n} in stride")
+                self.emit.emit(rv_slli(TMP_REG, TMP_REG, 2), "*4")
+                self.emit.emit(rv_add(S2_IN_BASE, S2_IN_BASE, TMP_REG),
+                               "input base += slice")
+                self.emit.emit_li32(TMP_REG, out_batch_stride,
+                                    f"batch n={_n} out stride")
+                self.emit.emit(rv_slli(TMP_REG, TMP_REG, 2), "*4")
+                self.emit.emit(rv_add(S5_OUT_BASE, S5_OUT_BASE, TMP_REG),
+                               "output base += slice")
 
-        # ih_base = oh * stride_h (precompute for this oh row)
-        self.emit.emit(rv_mul(IH_BASE_REG, OH_REG, STRIDE_H_REG),
-                       "ih_base = oh * stride_h")
+            # ── oc loop ────────────────────────────────────────────────
+            self.emit.emit(rv_addi(OC_REG, _R_ZERO, 0), f"oc=0 (C_out={C_out})")
+            L("_conv_oc_loop")
 
-        # ── ow loop ────────────────────────────────────────────────────
-        self.emit.emit(rv_addi(OW_REG, _R_ZERO, 0), f"ow=0 (W_out={W_out})")
-        L("_conv_ow_loop")
+            # ── oh loop ────────────────────────────────────────────────────
+            self.emit.emit(rv_addi(OH_REG, _R_ZERO, 0), f"oh=0 (H_out={H_out})")
+            L("_conv_oh_loop")
 
-        # iw_base = ow * stride_w (precompute for this column)
-        self.emit.emit(rv_mul(IW_BASE_REG, OW_REG, STRIDE_W_REG),
-                       "iw_base = ow * stride_w")
+            # ih_base = oh * stride_h (precompute for this oh row)
+            self.emit.emit(rv_mul(IH_BASE_REG, OH_REG, STRIDE_H_REG),
+                           "ih_base = oh * stride_h")
 
-        # Each output element starts a new reduction, including its bias.
-        self.emit.emit(rv_slli(TMP_REG, OC_REG, 2), "offset = oc*4")
-        self.emit.emit(rv_add(TMP_REG, S4_BIAS_BASE, TMP_REG), "+ bias_base")
-        self.emit.emit(rv_lw(ACC_REG, TMP_REG, 0), "acc = bias[oc]")
+            # ── ow loop ────────────────────────────────────────────────────
+            self.emit.emit(rv_addi(OW_REG, _R_ZERO, 0), f"ow=0 (W_out={W_out})")
+            L("_conv_ow_loop")
 
-        if no_pad and K == 3:
-            # ══════════════════════════════════════════════════════════════
-            # Unrolled K=3 no-pad fast path: fully unroll kw+kh loops
-            # + pointer-increment ic iteration (no address recalculation).
-            # ~7 instr/MAC vs ~12 before.  2026-06-08
-            # ══════════════════════════════════════════════════════════════
-            # ic_advance = bytes to advance IN_PTR to next ic's same spatial pos
-            # K*K loads plus K-1 row skips move (K-1)*W + K elements.
-            # The next channel's window starts H*W elements from this one.
-            ic_advance_bytes = (H * W - (K - 1) * W - K) * 4
-            IC_ADV_REG = KH_REG   # s10 freed: no kh counter needed
-            ROW_ADV_REG = KW_REG  # s11 freed: no kw counter needed
+            # iw_base = ow * stride_w (precompute for this column)
+            self.emit.emit(rv_mul(IW_BASE_REG, OW_REG, STRIDE_W_REG),
+                           "iw_base = ow * stride_w")
 
-            self.emit.emit_li32(IC_ADV_REG, ic_advance_bytes,
-                               f"ic_adv={ic_advance_bytes}")
-            self.emit.emit_li32(ROW_ADV_REG, W_minus_K_times_4,
-                               f"row_adv={W_minus_K_times_4}")
-
-            # ic = 0
-            self.emit.emit(rv_addi(IC_REG, _R_ZERO, 0),
-                           f"ic=0 (C_in={C_in})")
-
-            # ── Compute starting pointers for ic=0 (once, outside loop) ─
-            # IN_PTR = input_base + (ih_base * W + iw_base) * 4
-            self.emit.emit(rv_mul(T6_REG, IH_BASE_REG, W_REG),
-                           "inoff = ih_base * W")
-            self.emit.emit(rv_add(T6_REG, T6_REG, IW_BASE_REG),
-                           "+ iw_base")
-            self.emit.emit(rv_slli(T6_REG, T6_REG, 2),
-                           "* 4")
-            self.emit.emit(rv_add(IN_PTR, S2_IN_BASE, T6_REG),
-                           "in_ptr = &input[0, ih_base, iw_base]")
-            # WT_PTR = weight_base + oc * C_in*K*K * 4
-            self.emit.emit_li32(T6_REG, C_in_K_K, f"oc_wt_step={C_in_K_K}")
-            self.emit.emit(rv_mul(T6_REG, OC_REG, T6_REG), "wt_oc_base")
-            self.emit.emit(rv_slli(T6_REG, T6_REG, 2),
-                           f"wtoff = oc * {C_in_K_K} * 4")
-            self.emit.emit(rv_add(WT_PTR, S3_W_BASE, T6_REG),
-                           "wt_ptr = &weight[oc, 0, 0, 0]")
-
-            L("_conv_ic_loop")
-
-            # ── Fully unrolled 3×3 MAC block (9 MACs, no loop control) ─
-            # Row 0 (kh=0): MAC 0,1,2 then row advance
-            for _ in range(3):
-                self.emit.emit(rv_lw(VAL_REG, IN_PTR, 0),
-                               "load input")
-                self.emit.emit(rv_lw(T6_REG, WT_PTR, 0),
-                               "load weight")
-                self.emit.emit(rv_mul(T6_REG, VAL_REG, T6_REG),
-                               "Q16.16 mul")
-                self.emit.emit(rv_srai(T6_REG, T6_REG, 16),
-                               ">>16")
-                self.emit.emit(rv_add(ACC_REG, ACC_REG, T6_REG),
-                               "acc += prod")
-                self.emit.emit(rv_addi(IN_PTR, IN_PTR, 4),
-                               "in_ptr++")
-                self.emit.emit(rv_addi(WT_PTR, WT_PTR, 4),
-                               "wt_ptr++")
-            # Row advance: in_ptr += (W-K)*4
-            self.emit.emit(rv_add(IN_PTR, IN_PTR, ROW_ADV_REG),
-                           "in_ptr += row_adv to next row")
-
-            # Row 1 (kh=1): MAC 3,4,5 then row advance
-            for _ in range(3):
-                self.emit.emit(rv_lw(VAL_REG, IN_PTR, 0),
-                               "load input")
-                self.emit.emit(rv_lw(T6_REG, WT_PTR, 0),
-                               "load weight")
-                self.emit.emit(rv_mul(T6_REG, VAL_REG, T6_REG),
-                               "Q16.16 mul")
-                self.emit.emit(rv_srai(T6_REG, T6_REG, 16),
-                               ">>16")
-                self.emit.emit(rv_add(ACC_REG, ACC_REG, T6_REG),
-                               "acc += prod")
-                self.emit.emit(rv_addi(IN_PTR, IN_PTR, 4),
-                               "in_ptr++")
-                self.emit.emit(rv_addi(WT_PTR, WT_PTR, 4),
-                               "wt_ptr++")
-            # Row advance
-            self.emit.emit(rv_add(IN_PTR, IN_PTR, ROW_ADV_REG),
-                           "in_ptr += row_adv to next row")
-
-            # Row 2 (kh=2): MAC 6,7,8 (last row, no row advance after)
-            for _ in range(3):
-                self.emit.emit(rv_lw(VAL_REG, IN_PTR, 0),
-                               "load input")
-                self.emit.emit(rv_lw(T6_REG, WT_PTR, 0),
-                               "load weight")
-                self.emit.emit(rv_mul(T6_REG, VAL_REG, T6_REG),
-                               "Q16.16 mul")
-                self.emit.emit(rv_srai(T6_REG, T6_REG, 16),
-                               ">>16")
-                self.emit.emit(rv_add(ACC_REG, ACC_REG, T6_REG),
-                               "acc += prod")
-                self.emit.emit(rv_addi(IN_PTR, IN_PTR, 4),
-                               "in_ptr++")
-                self.emit.emit(rv_addi(WT_PTR, WT_PTR, 4),
-                               "wt_ptr++")
-
-            # ── Advance IN_PTR to next ic's same spatial position ─────
-            # WT_PTR already at next ic (weights contiguous across ic)
-            self.emit.emit(rv_add(IN_PTR, IN_PTR, IC_ADV_REG),
-                           "in_ptr += ic_advance")
-            # ic++ and loop
-            self.emit.emit(rv_addi(IC_REG, IC_REG, 1), "ic++")
-            self.emit.emit(rv_slt(COND_REG, IC_REG, C_IN_REG), "ic < C_in?")
-            self.emit.emit_branch(rv_bne, COND_REG, _R_ZERO,
-                                  "_conv_ic_loop", "loop ic")
-
-        else:
-            # ══════════════════════════════════════════════════════════════
-            # General loop path (K ≠ 3 or padded)
-            # ══════════════════════════════════════════════════════════════
-            # ── ic loop ────────────────────────────────────────────────
-            self.emit.emit(rv_addi(IC_REG, _R_ZERO, 0), f"ic=0 (C_in={C_in})")
-            L("_conv_ic_loop")
-
-            # Step 1: IN_PTR = input_base + ic * H*W * 4
-            self.emit.emit(rv_mul(VAL_REG, IC_REG, HW_REG),
-                           "ic_offset = ic * H*W")
-            self.emit.emit(rv_slli(VAL_REG, VAL_REG, 2),
-                           "ic_byte_off = ic_offset * 4")
-            self.emit.emit(rv_add(IN_PTR, S2_IN_BASE, VAL_REG),
-                           "in_ptr = input_base + ic*H*W*4")
-
-            # Step 2: WT_PTR = weight_base + oc * C_in*K*K * 4
-            self.emit.emit_li32(VAL_REG, C_in_K_K, f"oc_wt_step={C_in_K_K}")
-            self.emit.emit(rv_mul(VAL_REG, OC_REG, VAL_REG), "wt_oc_base")
-            self.emit.emit(rv_slli(VAL_REG, VAL_REG, 2),
-                           f"wt_oc_byte = {C_in_K_K}*4")
-            self.emit.emit(rv_add(WT_PTR, S3_W_BASE, VAL_REG),
-                           "wt_ptr = weight_base + oc_wt_byte")
-
-            # Step 3: IN_PTR += (ih_base * W + iw_base) * 4
-            self.emit.emit(rv_mul(VAL_REG, IH_BASE_REG, W_REG),
-                           "ih_off = ih_base * W")
-            self.emit.emit(rv_add(VAL_REG, VAL_REG, IW_BASE_REG),
-                           "row_off = ih*W + iw_base")
-            self.emit.emit(rv_slli(VAL_REG, VAL_REG, 2),
-                           "row_byte = row_off * 4")
-            self.emit.emit(rv_add(IN_PTR, IN_PTR, VAL_REG),
-                           "in_ptr = &input[ic, ih_base, iw_base]")
-
-            # Step 4: WT_PTR += ic * K*K * 4
-            self.emit.emit_li32(T6_REG, K_K, f"K*K = {K_K}")
-            self.emit.emit(rv_mul(VAL_REG, IC_REG, T6_REG),
-                           f"ic_wt_off = ic * {K_K}")
-            self.emit.emit(rv_slli(VAL_REG, VAL_REG, 2),
-                           "ic_wt_byte = ic_wt_off * 4")
-            self.emit.emit(rv_add(WT_PTR, WT_PTR, VAL_REG),
-                           "wt_ptr += ic * K*K * 4")
-
-            # ── kh loop ────────────────────────────────────────────────
-            self.emit.emit(rv_addi(KH_REG, _R_ZERO, 0), f"kh=0 (K={K})")
-            L("_conv_kh_loop")
-
-            # ── kw loop (innermost) ────────────────────────────────────
-            self.emit.emit(rv_addi(KW_REG, _R_ZERO, 0), f"kw=0 (K={K})")
-            L("_conv_kw_loop")
-
-            if no_pad:
-                # No-padding fast path: pointer-walking
-                self.emit.emit(rv_lw(VAL_REG, IN_PTR, 0),
-                               "load input[ic,ih,iw]")
-                self.emit.emit(rv_lw(T6_REG, WT_PTR, 0),
-                               "load weight[oc,ic,kh,kw]")
-                self.emit.emit(rv_mul(T6_REG, VAL_REG, T6_REG),
-                               "Q16.16 mul")
-                self.emit.emit(rv_srai(T6_REG, T6_REG, 16),
-                               ">> 16")
-                self.emit.emit(rv_add(ACC_REG, ACC_REG, T6_REG),
-                               "acc += product")
-                self.emit.emit(rv_addi(IN_PTR, IN_PTR, 4),
-                               "in_ptr += 4")
-                self.emit.emit(rv_addi(WT_PTR, WT_PTR, 4),
-                               "wt_ptr += 4")
-                self.emit.emit(rv_addi(KW_REG, KW_REG, 1), "kw++")
-                self.emit.emit(rv_slt(COND_REG, KW_REG, K_REG), "kw < K?")
-                self.emit.emit_branch(rv_bne, COND_REG, _R_ZERO,
-                                      "_conv_kw_loop", "loop kw")
+            # Each output element starts a new reduction, including its bias.
+            if b_name is not None:
+                self.emit.emit(rv_slli(TMP_REG, OC_REG, 2), "offset = oc*4")
+                self.emit.emit(rv_add(TMP_REG, S4_BIAS_BASE, TMP_REG), "+ bias_base")
+                self.emit.emit(rv_lw(ACC_REG, TMP_REG, 0), "acc = bias[oc]")
             else:
-                # Padding path: check coordinates before any input load.
-                self.emit.emit(rv_mul(TMP_REG, OH_REG, STRIDE_H_REG),
-                               "tmp = oh * stride_h")
-                self.emit.emit(rv_add(TMP_REG, TMP_REG, KH_REG), "tmp += kh")
-                self.emit.emit(rv_addi(TMP_REG, TMP_REG, -ph),
-                               f"tmp -= {ph}")
+                self.emit.emit(rv_addi(ACC_REG, _R_ZERO, 0), "acc = 0 (no bias)")
 
-                skip_label = f"_conv_skip_{len(self.emit.labels)}"
-                self.emit.emit(rv_slti(COND_REG, TMP_REG, 0), "ih < 0?")
-                self.emit.emit_branch(rv_bne, COND_REG, _R_ZERO, skip_label,
-                                      "skip if ih < 0")
-                self.emit.emit_li(T6_REG, H, f"H = {H}")
-                self.emit.emit(rv_slt(COND_REG, TMP_REG, T6_REG), "ih < H?")
-                self.emit.emit_branch(rv_beq, COND_REG, _R_ZERO, skip_label,
-                                      "skip if ih >= H")
+            if no_pad and K == 3:
+                # ══════════════════════════════════════════════════════════════
+                # Unrolled K=3 no-pad fast path: fully unroll kw+kh loops
+                # + pointer-increment ic iteration (no address recalculation).
+                # ~7 instr/MAC vs ~12 before.  2026-06-08
+                # ══════════════════════════════════════════════════════════════
+                # ic_advance = bytes to advance IN_PTR to next ic's same spatial pos
+                # K*K loads plus K-1 row skips move (K-1)*W + K elements.
+                # The next channel's window starts H*W elements from this one.
+                ic_advance_bytes = (H * W - (K - 1) * W - K) * 4
+                IC_ADV_REG = KH_REG   # s10 freed: no kh counter needed
+                ROW_ADV_REG = KW_REG  # s11 freed: no kw counter needed
 
-                self.emit.emit(rv_mul(VAL_REG, OW_REG, STRIDE_W_REG),
-                               "val = ow * stride_w")
-                self.emit.emit(rv_add(VAL_REG, VAL_REG, KW_REG), "val += kw")
-                self.emit.emit(rv_addi(VAL_REG, VAL_REG, -pw),
-                               f"val -= {pw}")
-                self.emit.emit(rv_slti(COND_REG, VAL_REG, 0), "iw < 0?")
-                self.emit.emit_branch(rv_bne, COND_REG, _R_ZERO, skip_label,
-                                      "skip if iw < 0")
+                self.emit.emit_li32(IC_ADV_REG, ic_advance_bytes,
+                                   f"ic_adv={ic_advance_bytes}")
+                self.emit.emit_li32(ROW_ADV_REG, W_minus_K_times_4,
+                                   f"row_adv={W_minus_K_times_4}")
 
-                self.emit.emit_li(T6_REG, W, f"W = {W}")
-                self.emit.emit(rv_slt(COND_REG, VAL_REG, T6_REG), "iw < W?")
-                self.emit.emit_branch(rv_beq, COND_REG, _R_ZERO, skip_label,
-                                      "skip if iw >= W")
+                # ic = 0
+                self.emit.emit(rv_addi(IC_REG, _R_ZERO, 0),
+                               f"ic=0 (C_in={C_in})")
 
-                self.emit.emit(rv_mul(T6_REG, IC_REG, HW_REG),
-                               "addr = ic*H*W")
-                self.emit.emit(rv_mul(COND_REG, TMP_REG, W_REG),
-                               "tmp = ih*W")
-                self.emit.emit(rv_add(T6_REG, T6_REG, COND_REG),
-                               "addr += ih*W")
-                self.emit.emit(rv_add(T6_REG, T6_REG, VAL_REG),
-                               "addr += iw")
-                self.emit.emit(rv_slli(T6_REG, T6_REG, 2), "addr *= 4")
-                self.emit.emit(rv_add(T6_REG, S2_IN_BASE, T6_REG),
-                               "addr += input_base")
-                self.emit.emit(rv_lw(VAL_REG, T6_REG, 0),
-                               "load input[ic,ih,iw]")
+                # ── Compute starting pointers for ic=0 (once, outside loop) ─
+                # IN_PTR = input_base + (ih_base * W + iw_base) * 4
+                self.emit.emit(rv_mul(T6_REG, IH_BASE_REG, W_REG),
+                               "inoff = ih_base * W")
+                self.emit.emit(rv_add(T6_REG, T6_REG, IW_BASE_REG),
+                               "+ iw_base")
+                self.emit.emit(rv_slli(T6_REG, T6_REG, 2),
+                               "* 4")
+                self.emit.emit(rv_add(IN_PTR, S2_IN_BASE, T6_REG),
+                               "in_ptr = &input[0, ih_base, iw_base]")
+                # WT_PTR = weight_base + oc * C_in*K*K * 4
+                self.emit.emit_li32(T6_REG, C_in_K_K, f"oc_wt_step={C_in_K_K}")
+                self.emit.emit(rv_mul(T6_REG, OC_REG, T6_REG), "wt_oc_base")
+                self.emit.emit(rv_slli(T6_REG, T6_REG, 2),
+                               f"wtoff = oc * {C_in_K_K} * 4")
+                self.emit.emit(rv_add(WT_PTR, S3_W_BASE, T6_REG),
+                               "wt_ptr = &weight[oc, 0, 0, 0]")
 
-                # WT_PTR already points at weight[oc, ic, 0, 0].
-                self.emit.emit(rv_mul(T6_REG, KH_REG, K_REG), "addr = kh*K")
-                self.emit.emit(rv_add(T6_REG, T6_REG, KW_REG),
-                               "addr += kw")
-                self.emit.emit(rv_slli(T6_REG, T6_REG, 2), "addr *= 4")
-                self.emit.emit(rv_add(T6_REG, WT_PTR, T6_REG),
-                               "addr += weight[oc,ic] base")
-                self.emit.emit(rv_lw(COND_REG, T6_REG, 0),
-                               "load weight[oc,ic,kh,kw]")
+                L("_conv_ic_loop")
 
-                self.emit.emit(rv_mul(T6_REG, VAL_REG, COND_REG),
-                               "Q16.16 mul")
-                self.emit.emit(rv_srai(T6_REG, T6_REG, 16),
-                               ">> 16")
-                self.emit.emit(rv_add(ACC_REG, ACC_REG, T6_REG),
-                               "acc += product")
+                # ── Fully unrolled 3×3 MAC block (9 MACs, no loop control) ─
+                # Row 0 (kh=0): MAC 0,1,2 then row advance
+                for _ in range(3):
+                    self.emit.emit(rv_lw(VAL_REG, IN_PTR, 0),
+                                   "load input")
+                    self.emit.emit(rv_lw(T6_REG, WT_PTR, 0),
+                                   "load weight")
+                    self.emit.emit(rv_mul(T6_REG, VAL_REG, T6_REG),
+                                   "Q16.16 mul")
+                    self.emit.emit(rv_srai(T6_REG, T6_REG, 16),
+                                   ">>16")
+                    self.emit.emit(rv_add(ACC_REG, ACC_REG, T6_REG),
+                                   "acc += prod")
+                    self.emit.emit(rv_addi(IN_PTR, IN_PTR, 4),
+                                   "in_ptr++")
+                    self.emit.emit(rv_addi(WT_PTR, WT_PTR, 4),
+                                   "wt_ptr++")
+                # Row advance: in_ptr += (W-K)*4
+                self.emit.emit(rv_add(IN_PTR, IN_PTR, ROW_ADV_REG),
+                               "in_ptr += row_adv to next row")
 
-                self.emit.label(skip_label)
+                # Row 1 (kh=1): MAC 3,4,5 then row advance
+                for _ in range(3):
+                    self.emit.emit(rv_lw(VAL_REG, IN_PTR, 0),
+                                   "load input")
+                    self.emit.emit(rv_lw(T6_REG, WT_PTR, 0),
+                                   "load weight")
+                    self.emit.emit(rv_mul(T6_REG, VAL_REG, T6_REG),
+                                   "Q16.16 mul")
+                    self.emit.emit(rv_srai(T6_REG, T6_REG, 16),
+                                   ">>16")
+                    self.emit.emit(rv_add(ACC_REG, ACC_REG, T6_REG),
+                                   "acc += prod")
+                    self.emit.emit(rv_addi(IN_PTR, IN_PTR, 4),
+                                   "in_ptr++")
+                    self.emit.emit(rv_addi(WT_PTR, WT_PTR, 4),
+                                   "wt_ptr++")
+                # Row advance
+                self.emit.emit(rv_add(IN_PTR, IN_PTR, ROW_ADV_REG),
+                               "in_ptr += row_adv to next row")
 
-                self.emit.emit(rv_addi(KW_REG, KW_REG, 1), "kw++")
-                self.emit.emit(rv_slt(COND_REG, KW_REG, K_REG), "kw < K?")
+                # Row 2 (kh=2): MAC 6,7,8 (last row, no row advance after)
+                for _ in range(3):
+                    self.emit.emit(rv_lw(VAL_REG, IN_PTR, 0),
+                                   "load input")
+                    self.emit.emit(rv_lw(T6_REG, WT_PTR, 0),
+                                   "load weight")
+                    self.emit.emit(rv_mul(T6_REG, VAL_REG, T6_REG),
+                                   "Q16.16 mul")
+                    self.emit.emit(rv_srai(T6_REG, T6_REG, 16),
+                                   ">>16")
+                    self.emit.emit(rv_add(ACC_REG, ACC_REG, T6_REG),
+                                   "acc += prod")
+                    self.emit.emit(rv_addi(IN_PTR, IN_PTR, 4),
+                                   "in_ptr++")
+                    self.emit.emit(rv_addi(WT_PTR, WT_PTR, 4),
+                                   "wt_ptr++")
+
+                # ── Advance IN_PTR to next ic's same spatial position ─────
+                # WT_PTR already at next ic (weights contiguous across ic)
+                self.emit.emit(rv_add(IN_PTR, IN_PTR, IC_ADV_REG),
+                               "in_ptr += ic_advance")
+                # ic++ and loop
+                self.emit.emit(rv_addi(IC_REG, IC_REG, 1), "ic++")
+                self.emit.emit(rv_slt(COND_REG, IC_REG, C_IN_REG), "ic < C_in?")
                 self.emit.emit_branch(rv_bne, COND_REG, _R_ZERO,
-                                      "_conv_kw_loop", "loop kw")
+                                      "_conv_ic_loop", "loop ic")
 
-            # ── After kw loop: advance for next kh row ─────────────────
-            if no_pad:
-                self.emit.emit(rv_addi(IN_PTR, IN_PTR, W_minus_K_times_4),
-                               f"in_ptr += (W({W})-K({K}))*4 = {W_minus_K_times_4}")
+            else:
+                # ══════════════════════════════════════════════════════════════
+                # General loop path (K ≠ 3 or padded)
+                # ══════════════════════════════════════════════════════════════
+                # ── ic loop ────────────────────────────────────────────────
+                self.emit.emit(rv_addi(IC_REG, _R_ZERO, 0), f"ic=0 (C_in={C_in})")
+                L("_conv_ic_loop")
 
-            # ── Increment kh ────────────────────────────────────────────
-            self.emit.emit(rv_addi(KH_REG, KH_REG, 1), "kh++")
-            self.emit.emit(rv_slt(COND_REG, KH_REG, K_REG), "kh < K?")
+                # Step 1: IN_PTR = input_base + ic * H*W * 4
+                self.emit.emit(rv_mul(VAL_REG, IC_REG, HW_REG),
+                               "ic_offset = ic * H*W")
+                self.emit.emit(rv_slli(VAL_REG, VAL_REG, 2),
+                               "ic_byte_off = ic_offset * 4")
+                self.emit.emit(rv_add(IN_PTR, S2_IN_BASE, VAL_REG),
+                               "in_ptr = input_base + ic*H*W*4")
+
+                # Step 2: WT_PTR = weight_base + oc * C_in*K*K * 4
+                self.emit.emit_li32(VAL_REG, C_in_K_K, f"oc_wt_step={C_in_K_K}")
+                self.emit.emit(rv_mul(VAL_REG, OC_REG, VAL_REG), "wt_oc_base")
+                self.emit.emit(rv_slli(VAL_REG, VAL_REG, 2),
+                               f"wt_oc_byte = {C_in_K_K}*4")
+                self.emit.emit(rv_add(WT_PTR, S3_W_BASE, VAL_REG),
+                               "wt_ptr = weight_base + oc_wt_byte")
+
+                # Step 3: IN_PTR += (ih_base * W + iw_base) * 4
+                self.emit.emit(rv_mul(VAL_REG, IH_BASE_REG, W_REG),
+                               "ih_off = ih_base * W")
+                self.emit.emit(rv_add(VAL_REG, VAL_REG, IW_BASE_REG),
+                               "row_off = ih*W + iw_base")
+                self.emit.emit(rv_slli(VAL_REG, VAL_REG, 2),
+                               "row_byte = row_off * 4")
+                self.emit.emit(rv_add(IN_PTR, IN_PTR, VAL_REG),
+                               "in_ptr = &input[ic, ih_base, iw_base]")
+
+                # Step 4: WT_PTR += ic * K*K * 4
+                self.emit.emit_li32(T6_REG, K_K, f"K*K = {K_K}")
+                self.emit.emit(rv_mul(VAL_REG, IC_REG, T6_REG),
+                               f"ic_wt_off = ic * {K_K}")
+                self.emit.emit(rv_slli(VAL_REG, VAL_REG, 2),
+                               "ic_wt_byte = ic_wt_off * 4")
+                self.emit.emit(rv_add(WT_PTR, WT_PTR, VAL_REG),
+                               "wt_ptr += ic * K*K * 4")
+
+                # ── kh loop ────────────────────────────────────────────────
+                self.emit.emit(rv_addi(KH_REG, _R_ZERO, 0), f"kh=0 (K={K})")
+                L("_conv_kh_loop")
+
+                # ── kw loop (innermost) ────────────────────────────────────
+                self.emit.emit(rv_addi(KW_REG, _R_ZERO, 0), f"kw=0 (K={K})")
+                L("_conv_kw_loop")
+
+                if no_pad:
+                    # No-padding fast path: pointer-walking
+                    self.emit.emit(rv_lw(VAL_REG, IN_PTR, 0),
+                                   "load input[ic,ih,iw]")
+                    self.emit.emit(rv_lw(T6_REG, WT_PTR, 0),
+                                   "load weight[oc,ic,kh,kw]")
+                    self.emit.emit(rv_mul(T6_REG, VAL_REG, T6_REG),
+                                   "Q16.16 mul")
+                    self.emit.emit(rv_srai(T6_REG, T6_REG, 16),
+                                   ">> 16")
+                    self.emit.emit(rv_add(ACC_REG, ACC_REG, T6_REG),
+                                   "acc += product")
+                    self.emit.emit(rv_addi(IN_PTR, IN_PTR, 4),
+                                   "in_ptr += 4")
+                    self.emit.emit(rv_addi(WT_PTR, WT_PTR, 4),
+                                   "wt_ptr += 4")
+                    self.emit.emit(rv_addi(KW_REG, KW_REG, 1), "kw++")
+                    self.emit.emit(rv_slt(COND_REG, KW_REG, K_REG), "kw < K?")
+                    self.emit.emit_branch(rv_bne, COND_REG, _R_ZERO,
+                                          "_conv_kw_loop", "loop kw")
+                else:
+                    # Padding path: check coordinates before any input load.
+                    self.emit.emit(rv_mul(TMP_REG, OH_REG, STRIDE_H_REG),
+                                   "tmp = oh * stride_h")
+                    self.emit.emit(rv_add(TMP_REG, TMP_REG, KH_REG), "tmp += kh")
+                    self.emit.emit(rv_addi(TMP_REG, TMP_REG, -ph),
+                                   f"tmp -= {ph}")
+
+                    skip_label = f"_conv_skip_{len(self.emit.labels)}"
+                    self.emit.emit(rv_slti(COND_REG, TMP_REG, 0), "ih < 0?")
+                    self.emit.emit_branch(rv_bne, COND_REG, _R_ZERO, skip_label,
+                                          "skip if ih < 0")
+                    self.emit.emit_li(T6_REG, H, f"H = {H}")
+                    self.emit.emit(rv_slt(COND_REG, TMP_REG, T6_REG), "ih < H?")
+                    self.emit.emit_branch(rv_beq, COND_REG, _R_ZERO, skip_label,
+                                          "skip if ih >= H")
+
+                    self.emit.emit(rv_mul(VAL_REG, OW_REG, STRIDE_W_REG),
+                                   "val = ow * stride_w")
+                    self.emit.emit(rv_add(VAL_REG, VAL_REG, KW_REG), "val += kw")
+                    self.emit.emit(rv_addi(VAL_REG, VAL_REG, -pw),
+                                   f"val -= {pw}")
+                    self.emit.emit(rv_slti(COND_REG, VAL_REG, 0), "iw < 0?")
+                    self.emit.emit_branch(rv_bne, COND_REG, _R_ZERO, skip_label,
+                                          "skip if iw < 0")
+
+                    self.emit.emit_li(T6_REG, W, f"W = {W}")
+                    self.emit.emit(rv_slt(COND_REG, VAL_REG, T6_REG), "iw < W?")
+                    self.emit.emit_branch(rv_beq, COND_REG, _R_ZERO, skip_label,
+                                          "skip if iw >= W")
+
+                    self.emit.emit(rv_mul(T6_REG, IC_REG, HW_REG),
+                                   "addr = ic*H*W")
+                    self.emit.emit(rv_mul(COND_REG, TMP_REG, W_REG),
+                                   "tmp = ih*W")
+                    self.emit.emit(rv_add(T6_REG, T6_REG, COND_REG),
+                                   "addr += ih*W")
+                    self.emit.emit(rv_add(T6_REG, T6_REG, VAL_REG),
+                                   "addr += iw")
+                    self.emit.emit(rv_slli(T6_REG, T6_REG, 2), "addr *= 4")
+                    self.emit.emit(rv_add(T6_REG, S2_IN_BASE, T6_REG),
+                                   "addr += input_base")
+                    self.emit.emit(rv_lw(VAL_REG, T6_REG, 0),
+                                   "load input[ic,ih,iw]")
+
+                    # WT_PTR already points at weight[oc, ic, 0, 0].
+                    self.emit.emit(rv_mul(T6_REG, KH_REG, K_REG), "addr = kh*K")
+                    self.emit.emit(rv_add(T6_REG, T6_REG, KW_REG),
+                                   "addr += kw")
+                    self.emit.emit(rv_slli(T6_REG, T6_REG, 2), "addr *= 4")
+                    self.emit.emit(rv_add(T6_REG, WT_PTR, T6_REG),
+                                   "addr += weight[oc,ic] base")
+                    self.emit.emit(rv_lw(COND_REG, T6_REG, 0),
+                                   "load weight[oc,ic,kh,kw]")
+
+                    self.emit.emit(rv_mul(T6_REG, VAL_REG, COND_REG),
+                                   "Q16.16 mul")
+                    self.emit.emit(rv_srai(T6_REG, T6_REG, 16),
+                                   ">> 16")
+                    self.emit.emit(rv_add(ACC_REG, ACC_REG, T6_REG),
+                                   "acc += product")
+
+                    self.emit.label(skip_label)
+
+                    self.emit.emit(rv_addi(KW_REG, KW_REG, 1), "kw++")
+                    self.emit.emit(rv_slt(COND_REG, KW_REG, K_REG), "kw < K?")
+                    self.emit.emit_branch(rv_bne, COND_REG, _R_ZERO,
+                                          "_conv_kw_loop", "loop kw")
+
+                # ── After kw loop: advance for next kh row ─────────────────
+                if no_pad:
+                    self.emit.emit(rv_addi(IN_PTR, IN_PTR, W_minus_K_times_4),
+                                   f"in_ptr += (W({W})-K({K}))*4 = {W_minus_K_times_4}")
+
+                # ── Increment kh ────────────────────────────────────────────
+                self.emit.emit(rv_addi(KH_REG, KH_REG, 1), "kh++")
+                self.emit.emit(rv_slt(COND_REG, KH_REG, K_REG), "kh < K?")
+                self.emit.emit_branch(rv_bne, COND_REG, _R_ZERO,
+                                      "_conv_kh_loop", "loop kh")
+
+                # ── Increment ic ────────────────────────────────────────────
+                self.emit.emit(rv_addi(IC_REG, IC_REG, 1), "ic++")
+                self.emit.emit(rv_slt(COND_REG, IC_REG, C_IN_REG), "ic < C_in?")
+                self.emit.emit_branch(rv_bne, COND_REG, _R_ZERO,
+                                      "_conv_ic_loop", "loop ic")
+
+            # ── Store output[oc, oh, ow] = acc ─────────────────────────────
+            # out_offset = oc*H_out*W_out + oh*W_out + ow
+            self.emit.emit_li(TMP_REG, H_out_W_out, f"H_out*W_out={H_out_W_out}")
+            self.emit.emit(rv_mul(TMP_REG, OC_REG, TMP_REG),
+                           "addr = oc * H_out_W_out")
+            self.emit.emit_li(T6_REG, W_out, f"W_out={W_out}")
+            self.emit.emit(rv_mul(T6_REG, OH_REG, T6_REG),
+                           "tmp = oh * W_out")
+            self.emit.emit(rv_add(TMP_REG, TMP_REG, T6_REG),
+                           "addr += oh * W_out")
+            self.emit.emit(rv_add(TMP_REG, TMP_REG, OW_REG),
+                           "addr += ow")
+            self.emit.emit(rv_slli(TMP_REG, TMP_REG, 2), "addr *= 4")
+            self.emit.emit(rv_add(TMP_REG, S5_OUT_BASE, TMP_REG),
+                           "+ output_base")
+            self.emit.emit(rv_sw(TMP_REG, ACC_REG, 0),
+                           "store output[oc,oh,ow]")
+
+            # ── Increment ow ────────────────────────────────────────────────
+            self.emit.emit(rv_addi(OW_REG, OW_REG, 1), "ow++")
+            self.emit.emit_li(T6_REG, W_out, f"W_out={W_out}")
+            self.emit.emit(rv_slt(COND_REG, OW_REG, T6_REG), "ow < W_out?")
             self.emit.emit_branch(rv_bne, COND_REG, _R_ZERO,
-                                  "_conv_kh_loop", "loop kh")
+                                  "_conv_ow_loop", "loop ow")
 
-            # ── Increment ic ────────────────────────────────────────────
-            self.emit.emit(rv_addi(IC_REG, IC_REG, 1), "ic++")
-            self.emit.emit(rv_slt(COND_REG, IC_REG, C_IN_REG), "ic < C_in?")
+            # ── Increment oh ────────────────────────────────────────────────
+            self.emit.emit(rv_addi(OH_REG, OH_REG, 1), "oh++")
+            self.emit.emit_li(T6_REG, H_out, f"H_out={H_out}")
+            self.emit.emit(rv_slt(COND_REG, OH_REG, T6_REG), "oh < H_out?")
             self.emit.emit_branch(rv_bne, COND_REG, _R_ZERO,
-                                  "_conv_ic_loop", "loop ic")
+                                  "_conv_oh_loop", "loop oh")
 
-        # ── Store output[oc, oh, ow] = acc ─────────────────────────────
-        # out_offset = oc*H_out*W_out + oh*W_out + ow
-        self.emit.emit_li(TMP_REG, H_out_W_out, f"H_out*W_out={H_out_W_out}")
-        self.emit.emit(rv_mul(TMP_REG, OC_REG, TMP_REG),
-                       "addr = oc * H_out_W_out")
-        self.emit.emit_li(T6_REG, W_out, f"W_out={W_out}")
-        self.emit.emit(rv_mul(T6_REG, OH_REG, T6_REG),
-                       "tmp = oh * W_out")
-        self.emit.emit(rv_add(TMP_REG, TMP_REG, T6_REG),
-                       "addr += oh * W_out")
-        self.emit.emit(rv_add(TMP_REG, TMP_REG, OW_REG),
-                       "addr += ow")
-        self.emit.emit(rv_slli(TMP_REG, TMP_REG, 2), "addr *= 4")
-        self.emit.emit(rv_add(TMP_REG, S5_OUT_BASE, TMP_REG),
-                       "+ output_base")
-        self.emit.emit(rv_sw(TMP_REG, ACC_REG, 0),
-                       "store output[oc,oh,ow]")
+            # ── Increment oc ────────────────────────────────────────────────
+            self.emit.emit(rv_addi(OC_REG, OC_REG, 1), "oc++")
+            self.emit.emit_li(T6_REG, C_out, f"C_out={C_out}")
+            self.emit.emit(rv_slt(COND_REG, OC_REG, T6_REG), "oc < C_out?")
+            self.emit.emit_branch(rv_bne, COND_REG, _R_ZERO,
+                                  "_conv_oc_loop", "loop oc")
 
-        # ── Increment ow ────────────────────────────────────────────────
-        self.emit.emit(rv_addi(OW_REG, OW_REG, 1), "ow++")
-        self.emit.emit_li(T6_REG, W_out, f"W_out={W_out}")
-        self.emit.emit(rv_slt(COND_REG, OW_REG, T6_REG), "ow < W_out?")
-        self.emit.emit_branch(rv_bne, COND_REG, _R_ZERO,
-                              "_conv_ow_loop", "loop ow")
-
-        # ── Increment oh ────────────────────────────────────────────────
-        self.emit.emit(rv_addi(OH_REG, OH_REG, 1), "oh++")
-        self.emit.emit_li(T6_REG, H_out, f"H_out={H_out}")
-        self.emit.emit(rv_slt(COND_REG, OH_REG, T6_REG), "oh < H_out?")
-        self.emit.emit_branch(rv_bne, COND_REG, _R_ZERO,
-                              "_conv_oh_loop", "loop oh")
-
-        # ── Increment oc ────────────────────────────────────────────────
-        self.emit.emit(rv_addi(OC_REG, OC_REG, 1), "oc++")
-        self.emit.emit_li(T6_REG, C_out, f"C_out={C_out}")
-        self.emit.emit(rv_slt(COND_REG, OC_REG, T6_REG), "oc < C_out?")
-        self.emit.emit_branch(rv_bne, COND_REG, _R_ZERO,
-                              "_conv_oc_loop", "loop oc")
+            # restore label prefix after this batch copy
+            self.emit.label_prefix = previous_prefix
 
     # ── ReLU ───────────────────────────────────────────────────────────
 
@@ -2321,7 +2472,8 @@ class CNNRISCVGenerator:
         """
         a_name = node.inputs[0]
         w_name = node.inputs[1]
-        b_name = node.inputs[2]
+        # Gemm bias (C) is optional; a missing third input means "no bias".
+        b_name = node.inputs[2] if len(node.inputs) > 2 and node.inputs[2] else None
         out_name = node.outputs[0]
 
         a_shape = self.model.get_shape(a_name)
@@ -2345,7 +2497,8 @@ class CNNRISCVGenerator:
 
         self._get_workspace_addr(a_name, self.S2)
         self._get_weight_addr(w_name, self.S3)
-        self._get_weight_addr(b_name, self.S4)
+        if b_name is not None:
+            self._get_weight_addr(b_name, self.S4)
         self._get_workspace_addr(out_name, self.S5)
 
         # Nested loops: for i in range(M), for j in range(N)
@@ -2368,10 +2521,13 @@ class CNNRISCVGenerator:
         self.emit.emit(rv_addi(j_reg, _R_ZERO, 0), f"j=0 (N={N})")
         L("_gemm_j_loop")
 
-        # Load bias[j] → acc
-        self.emit.emit(rv_slli(addr_reg, j_reg, 2), "addr = j*4")
-        self.emit.emit(rv_add(addr_reg, self.S4, addr_reg), "addr += bias_base")
-        self.emit.emit(rv_lw(acc_reg, addr_reg, 0), "acc = bias[j]")
+        # Load bias[j] → acc (or zero when Gemm has no C input)
+        if b_name is not None:
+            self.emit.emit(rv_slli(addr_reg, j_reg, 2), "addr = j*4")
+            self.emit.emit(rv_add(addr_reg, self.S4, addr_reg), "addr += bias_base")
+            self.emit.emit(rv_lw(acc_reg, addr_reg, 0), "acc = bias[j]")
+        else:
+            self.emit.emit(rv_addi(acc_reg, _R_ZERO, 0), "acc = 0 (no bias)")
 
         # k = 0
         self.emit.emit(rv_addi(k_reg, _R_ZERO, 0), f"k=0 (K={K})")
@@ -2555,9 +2711,864 @@ class CNNRISCVGenerator:
         self.emit.emit(rv_slt(cond_reg, i_reg, self.T6), "i < num_el?")
         self.emit.emit_branch(rv_bne, cond_reg, _R_ZERO, "_reshape_loop", "loop")
 
+    # ── FWHT ───────────────────────────────────────────────────────────
+
+    def _gen_fwht(self, node: NodeInfo) -> None:
+        """Scalar iterative FWHT over the flattened input (N a power of two).
+
+        Algorithm (standard in-place butterfly on Q16.16 values):
+          for length in 1, 2, 4, ..., N/2:
+            for i in range(0, N, 2*length):
+              for j in range(length):
+                u = a[i+j]; v = a[i+j+length]
+                a[i+j] = u+v; a[i+j+length] = u-v
+
+        The input is first copied to the output workspace, then transformed
+        in place there (input and output are distinct buffers).
+        """
+        x_name = node.inputs[0]
+        out_name = node.outputs[0]
+        shape = self.model.get_shape(x_name)
+
+        num_el = 1
+        for d in shape:
+            num_el *= d
+
+        if num_el <= 0 or (num_el & (num_el - 1)) != 0:
+            raise ValueError(
+                f"Fwht requires a power-of-two element count, got {num_el}"
+            )
+
+        direction = node.attrs.get("direction", "forward")
+        if direction not in ("forward", "inverse"):
+            raise ValueError(
+                f"Fwht direction must be 'forward' or 'inverse', got {direction!r}"
+            )
+        # Inverse = forward Hadamard (H is symmetric, H^2 = N*I) then scale 1/N.
+        # N is a power of two, so 1/N is an arithmetic right shift by log2(N).
+        inv_shift = num_el.bit_length() - 1
+
+        self.mem.alloc_workspace(out_name, num_el)
+
+        self._get_workspace_addr(x_name, self.S2)
+        self._get_workspace_addr(out_name, self.S5)
+
+        L = self.emit.label
+
+        # ── Copy input → output workspace ──────────────────────────────
+        i_reg = self.S6
+        addr_src = self.T3
+        addr_dst = self.T5
+        val_reg = self.T1
+        cond_reg = self.T4
+
+        self.emit.emit(rv_addi(i_reg, _R_ZERO, 0), f"fwht copy ({num_el} el)")
+        L("_fwht_copy_loop")
+        self.emit.emit(rv_slli(addr_src, i_reg, 2), "")
+        self.emit.emit(rv_add(addr_src, self.S2, addr_src), "")
+        self.emit.emit(rv_lw(val_reg, addr_src, 0), "load src[i]")
+        self.emit.emit(rv_slli(addr_dst, i_reg, 2), "")
+        self.emit.emit(rv_add(addr_dst, self.S5, addr_dst), "")
+        self.emit.emit(rv_sw(addr_dst, val_reg, 0), "store dst[i]")
+        self.emit.emit(rv_addi(i_reg, i_reg, 1), "i++")
+        self.emit.emit_li32(self.T6, num_el, f"n={num_el}")
+        self.emit.emit(rv_slt(cond_reg, i_reg, self.T6), "i < n?")
+        self.emit.emit_branch(rv_bne, cond_reg, _R_ZERO, "_fwht_copy_loop", "loop")
+
+        # ── Butterflies (in place on output workspace) ─────────────────
+        len_reg = self.S6       # current butterfly length
+        i_reg = self.S7         # block start index
+        j_reg = self.S8         # offset inside block
+        idx_reg = self.S9       # i + j
+        step_reg = self.S10     # 2 * length
+        n_reg = self.S11        # N (loop-invariant)
+
+        addr_a = self.T3
+        addr_b = self.T5
+        u_reg = self.T0
+        v_reg = self.T1
+        cond_reg = self.T4
+        tmp_reg = self.T6
+
+        self.emit.emit_li32(n_reg, num_el, f"N={num_el}")
+        self.emit.emit(rv_addi(len_reg, _R_ZERO, 1), "length = 1")
+
+        L("_fwht_len_loop")
+        self.emit.emit(rv_slt(cond_reg, len_reg, n_reg), "length < N?")
+        self.emit.emit_branch(rv_beq, cond_reg, _R_ZERO, "_fwht_done", "exit")
+        self.emit.emit(rv_slli(step_reg, len_reg, 1), "step = 2*length")
+
+        self.emit.emit(rv_addi(i_reg, _R_ZERO, 0), "i = 0")
+        L("_fwht_i_loop")
+        self.emit.emit(rv_addi(j_reg, _R_ZERO, 0), "j = 0")
+        L("_fwht_j_loop")
+
+        # addr_a = out + (i+j)*4 ; addr_b = out + (i+j+length)*4
+        self.emit.emit(rv_add(idx_reg, i_reg, j_reg), "idx = i+j")
+        self.emit.emit(rv_slli(addr_a, idx_reg, 2), "idx*4")
+        self.emit.emit(rv_add(addr_a, self.S5, addr_a), "addr_a")
+        self.emit.emit(rv_add(tmp_reg, idx_reg, len_reg), "idx+length")
+        self.emit.emit(rv_slli(tmp_reg, tmp_reg, 2), "(idx+length)*4")
+        self.emit.emit(rv_add(addr_b, self.S5, tmp_reg), "addr_b")
+
+        self.emit.emit(rv_lw(u_reg, addr_a, 0), "u = a[idx]")
+        self.emit.emit(rv_lw(v_reg, addr_b, 0), "v = a[idx+length]")
+        self.emit.emit(rv_add(tmp_reg, u_reg, v_reg), "u+v")
+        self.emit.emit(rv_sw(addr_a, tmp_reg, 0), "a[idx] = u+v")
+        self.emit.emit(rv_sub(tmp_reg, u_reg, v_reg), "u-v")
+        self.emit.emit(rv_sw(addr_b, tmp_reg, 0), "a[idx+length] = u-v")
+
+        # j++ ; j < length?
+        self.emit.emit(rv_addi(j_reg, j_reg, 1), "j++")
+        self.emit.emit(rv_slt(cond_reg, j_reg, len_reg), "j < length?")
+        self.emit.emit_branch(rv_bne, cond_reg, _R_ZERO, "_fwht_j_loop", "loop j")
+
+        # i += step ; i < N?
+        self.emit.emit(rv_add(i_reg, i_reg, step_reg), "i += step")
+        self.emit.emit(rv_slt(cond_reg, i_reg, n_reg), "i < N?")
+        self.emit.emit_branch(rv_bne, cond_reg, _R_ZERO, "_fwht_i_loop", "loop i")
+
+        # length *= 2 ; loop
+        self.emit.emit(rv_slli(len_reg, len_reg, 1), "length *= 2")
+        self.emit.emit_jump(rv_j, "_fwht_len_loop", "loop length")
+
+        L("_fwht_done")
+
+        # ── Inverse scaling: a[i] = a[i] >> log2(N) ────────────────────
+        if direction == "inverse" and inv_shift > 0:
+            i_reg = self.S6
+            addr = self.T3
+            val = self.T1
+            cond = self.T4
+            self.emit.emit(rv_addi(i_reg, _R_ZERO, 0), "inv-scale i=0")
+            L("_fwht_scale_loop")
+            self.emit.emit(rv_slli(addr, i_reg, 2), "")
+            self.emit.emit(rv_add(addr, self.S5, addr), "")
+            self.emit.emit(rv_lw(val, addr, 0), "load a[i]")
+            self.emit.emit(rv_srai(val, val, inv_shift), f"a[i] >>= {inv_shift}")
+            self.emit.emit(rv_sw(addr, val, 0), "store a[i]")
+            self.emit.emit(rv_addi(i_reg, i_reg, 1), "i++")
+            self.emit.emit_li32(self.T6, num_el, f"n={num_el}")
+            self.emit.emit(rv_slt(cond, i_reg, self.T6), "i < n?")
+            self.emit.emit_branch(rv_bne, cond, _R_ZERO, "_fwht_scale_loop", "loop")
+
+    # ── Sparse matrix multiply (CSR) ───────────────────────────────────
+
+    def _gen_spmmcsr(self, node: NodeInfo) -> None:
+        """CSR sparse matrix × dense matrix (SpMM; N=1 degenerates to SpMV).
+
+        Inputs: (values[q16, nnz], col_indices[int32, nnz],
+                 row_ptr[int32, M+1], B[q16, K, N]) -> C[q16, M, N]
+
+        for i in range(M):
+            for n in range(N): C[i,n] = 0
+            for j in row_ptr[i] .. row_ptr[i+1]-1:
+                a = values[j]; k = col_indices[j]
+                for n in range(N):
+                    C[i,n] += (a * B[k,n]) >> 16
+        """
+        v_name = node.inputs[0]
+        col_name = node.inputs[1]
+        row_name = node.inputs[2]
+        b_name = node.inputs[3]
+        out_name = node.outputs[0]
+
+        row_shape = self.model.get_shape(row_name)
+        M = (row_shape[0] - 1) if row_shape else 0
+        b_shape = self.model.get_shape(b_name)
+        N = b_shape[1] if len(b_shape) >= 2 else 1
+
+        self.mem.alloc_workspace(out_name, M * N)
+
+        base_v = self.S2
+        base_col = self.S3
+        base_row = self.S4
+        base_b = self.S5
+        base_c = self.S6
+
+        i_reg = self.S7
+        j_reg = self.S8
+        jend_reg = self.S9
+        n_reg = self.S10
+        ncol_reg = self.S11
+
+        acc = self.T0
+        a_reg = self.T1
+        k_reg = self.T2
+        addr = self.T3
+        cond = self.T4
+        tmp = self.T6
+
+        self._get_weight_addr(v_name, base_v)
+        self._get_weight_addr(col_name, base_col)
+        self._get_weight_addr(row_name, base_row)
+        self._get_workspace_addr(b_name, base_b)
+        self._get_workspace_addr(out_name, base_c)
+
+        self.emit.emit_li(ncol_reg, N, f"N={N}")
+
+        L = self.emit.label
+
+        # for i in range(M) — condition at top so M=0 is a no-op
+        self.emit.emit(rv_addi(i_reg, _R_ZERO, 0), f"i=0 (M={M})")
+        L("_spmm_i_loop")
+        self.emit.emit_li32(tmp, M, f"M={M}")
+        self.emit.emit(rv_slt(cond, i_reg, tmp), "i < M?")
+        self.emit.emit_branch(rv_beq, cond, _R_ZERO, "_spmm_done", "exit")
+
+        # j = row_ptr[i]; j_end = row_ptr[i+1]
+        self.emit.emit(rv_slli(addr, i_reg, 2), "i*4")
+        self.emit.emit(rv_add(addr, base_row, addr), "&row_ptr[i]")
+        self.emit.emit(rv_lw(j_reg, addr, 0), "j = row_ptr[i]")
+        self.emit.emit(rv_lw(jend_reg, addr, 4), "j_end = row_ptr[i+1]")
+
+        # Zero the C row: for n in range(N)
+        self.emit.emit(rv_addi(n_reg, _R_ZERO, 0), "n=0 (zero)")
+        L("_spmm_zero_loop")
+        self.emit.emit(rv_mul(tmp, i_reg, ncol_reg), "i*N")
+        self.emit.emit(rv_add(tmp, tmp, n_reg), "+ n")
+        self.emit.emit(rv_slli(tmp, tmp, 2), "*4")
+        self.emit.emit(rv_add(tmp, base_c, tmp), "&C[i,n]")
+        self.emit.emit(rv_sw(tmp, _R_ZERO, 0), "C[i,n] = 0")
+        self.emit.emit(rv_addi(n_reg, n_reg, 1), "n++")
+        self.emit.emit(rv_slt(cond, n_reg, ncol_reg), "n < N?")
+        self.emit.emit_branch(rv_bne, cond, _R_ZERO, "_spmm_zero_loop", "loop")
+
+        # for j in [j, j_end)
+        L("_spmm_j_loop")
+        self.emit.emit(rv_slt(cond, j_reg, jend_reg), "j < j_end?")
+        self.emit.emit_branch(rv_beq, cond, _R_ZERO, "_spmm_j_done", "exit")
+
+        # a = values[j]
+        self.emit.emit(rv_slli(addr, j_reg, 2), "j*4")
+        self.emit.emit(rv_add(addr, base_v, addr), "&values[j]")
+        self.emit.emit(rv_lw(a_reg, addr, 0), "a = values[j]")
+        # k = col_indices[j]  (indirect load -> addresses B's row)
+        self.emit.emit(rv_slli(addr, j_reg, 2), "j*4")
+        self.emit.emit(rv_add(addr, base_col, addr), "&col[j]")
+        self.emit.emit(rv_lw(k_reg, addr, 0), "k = col[j]")
+
+        # for n in range(N)
+        self.emit.emit(rv_addi(n_reg, _R_ZERO, 0), "n=0")
+        L("_spmm_n_loop")
+        # B[k,n]
+        self.emit.emit(rv_mul(tmp, k_reg, ncol_reg), "k*N")
+        self.emit.emit(rv_add(tmp, tmp, n_reg), "+ n")
+        self.emit.emit(rv_slli(tmp, tmp, 2), "*4")
+        self.emit.emit(rv_add(tmp, base_b, tmp), "&B[k,n]")
+        self.emit.emit(rv_lw(tmp, tmp, 0), "load B[k,n]")
+        self.emit.emit(rv_mul(tmp, a_reg, tmp), "a*B (low32)")
+        self.emit.emit(rv_srai(tmp, tmp, 16), ">>16")
+        # C[i,n] += prod
+        self.emit.emit(rv_mul(addr, i_reg, ncol_reg), "i*N")
+        self.emit.emit(rv_add(addr, addr, n_reg), "+ n")
+        self.emit.emit(rv_slli(addr, addr, 2), "*4")
+        self.emit.emit(rv_add(addr, base_c, addr), "&C[i,n]")
+        self.emit.emit(rv_lw(acc, addr, 0), "old C")
+        self.emit.emit(rv_add(acc, acc, tmp), "+= prod")
+        self.emit.emit(rv_sw(addr, acc, 0), "store C[i,n]")
+        # n++
+        self.emit.emit(rv_addi(n_reg, n_reg, 1), "n++")
+        self.emit.emit(rv_slt(cond, n_reg, ncol_reg), "n < N?")
+        self.emit.emit_branch(rv_bne, cond, _R_ZERO, "_spmm_n_loop", "loop")
+
+        # j++
+        self.emit.emit(rv_addi(j_reg, j_reg, 1), "j++")
+        self.emit.emit_jump(rv_j, "_spmm_j_loop", "loop j")
+
+        L("_spmm_j_done")
+        # i++
+        self.emit.emit(rv_addi(i_reg, i_reg, 1), "i++")
+        self.emit.emit_jump(rv_j, "_spmm_i_loop", "loop i")
+
+        L("_spmm_done")
+
+    # ── Winograd F(2,3) convolution ─────────────────────────────────────
+
+    def _gen_winogradconv(self, node: NodeInfo) -> None:
+        """2D Winograd F(2,3) convolution (stride=1, SAME padding).
+
+        Y_tile = A^T [ sum_ic (G g G^T) ⊙ (B^T d B) ] A
+        Kernel transform U = G g G^T is folded at compile time (2.2) into the
+        initializer named in ``attrs["_winograd_u"]``.
+        """
+        x_name = node.inputs[0]
+        w_name = node.inputs[1]
+        b_name = node.inputs[2] if len(node.inputs) > 2 and node.inputs[2] else None
+        out_name = node.outputs[0]
+
+        x_shape = self.model.get_shape(x_name)
+        w_shape = self.model.get_shape(w_name)
+        N = x_shape[0] if len(x_shape) > 0 else 1
+        Cin = x_shape[1] if len(x_shape) > 1 else 1
+        H = x_shape[2] if len(x_shape) > 2 else 1
+        W = x_shape[3] if len(x_shape) > 3 else 1
+        Cout = w_shape[0] if len(w_shape) > 0 else 1
+        KH = w_shape[2] if len(w_shape) > 2 else 3
+
+        attrs = node.attrs
+        pads = list(attrs.get("pads", [1, 1, 1, 1]))[:4]
+        if pads != [1, 1, 1, 1]:
+            raise ValueError("WinogradConv requires pads=[1,1,1,1] (SAME, stride 1)")
+        if list(attrs.get("strides", [1, 1]))[:2] != [1, 1]:
+            raise ValueError("WinogradConv requires strides=[1,1]")
+        if KH != 3:
+            raise ValueError("WinogradConv supports 3x3 kernels only")
+        u_name = attrs.get("_winograd_u")
+        if not u_name:
+            raise ValueError("WinogradConv missing precomputed kernel (2.2)")
+
+        TH = (H + 1) // 2
+        TW = (W + 1) // 2
+        Hout, Wout = H, W
+
+        d_name = f"{out_name}__d"
+        v_name = f"{out_name}__v"
+        acc_name = f"{out_name}__acc"
+        for nm in (d_name, v_name, acc_name):
+            self.mem.alloc_workspace(nm, 16)
+        self.mem.alloc_workspace(out_name, N * Cout * Hout * Wout)
+
+        base_in = self.S2
+        base_u = self.S3
+        base_out = self.S4
+        base_d = self.S5
+        base_v = self.S6
+        base_acc = self.S7
+        base_bias = self.S8
+
+        n_reg = self.S9
+        oc_reg = self.S10
+        ti_reg = self.S11
+        tj_reg = self.T4
+        ic_reg = self.T5
+
+        T0, T1, T2, T3, T6 = self.T0, self.T1, self.T2, self.T3, self.T6
+
+        self._get_workspace_addr(x_name, base_in)
+        self._get_weight_addr(u_name, base_u)
+        self._get_workspace_addr(out_name, base_out)
+        self._get_workspace_addr(d_name, base_d)
+        self._get_workspace_addr(v_name, base_v)
+        self._get_workspace_addr(acc_name, base_acc)
+        if b_name is not None:
+            self._get_weight_addr(b_name, base_bias)
+
+        BT = _WINO_F23_BT
+        Bm = [[BT[b][a] for b in range(4)] for a in range(4)]  # B[a][b] = BT[b][a]
+        AT = _WINO_F23_AT
+        A = [[AT[b][a] for b in range(2)] for a in range(4)]   # A[a][b] = AT[b][a]
+
+        E = self.emit.emit
+        Br = self.emit.emit_branch
+        J = self.emit.emit_jump
+        L = self.emit.label
+        li = self.emit.emit_li
+
+        # for n
+        E(rv_addi(n_reg, _R_ZERO, 0), f"n=0 (N={N})")
+        L("_wg_n_loop")
+        E(rv_addi(oc_reg, _R_ZERO, 0), f"oc=0 (Cout={Cout})")
+        L("_wg_oc_loop")
+        E(rv_addi(ti_reg, _R_ZERO, 0), f"ti=0 (TH={TH})")
+        L("_wg_ti_loop")
+        E(rv_addi(tj_reg, _R_ZERO, 0), f"tj=0 (TW={TW})")
+        L("_wg_tj_loop")
+
+        # zero the 4x4 Winograd-domain accumulator
+        for p in range(16):
+            E(rv_sw(base_acc, _R_ZERO, 4 * p), "" if p else "acc[:] = 0")
+
+        E(rv_addi(ic_reg, _R_ZERO, 0), f"ic=0 (Cin={Cin})")
+        L("_wg_ic_loop")
+
+        # ── load padded 4x4 input tile into dbuf ──────────────────────
+        for r in range(4):
+            for c in range(4):
+                E(rv_slli(T0, ti_reg, 1), "")
+                E(rv_addi(T0, T0, r - 1), "")                 # gi = 2*ti-1+r
+                E(rv_slli(T1, tj_reg, 1), "")
+                E(rv_addi(T1, T1, c - 1), "")                 # gj = 2*tj-1+c
+                E(rv_addi(T2, _R_ZERO, 0), "")                # default 0
+                skip = f"_wg_dskip_{r}_{c}"
+                Br(rv_blt, T0, _R_ZERO, skip, "")             # gi < 0
+                Br(rv_blt, T1, _R_ZERO, skip, "")             # gj < 0
+                li(T6, H)
+                E(rv_slt(T3, T0, T6), "")
+                Br(rv_beq, T3, _R_ZERO, skip, "")             # gi >= H
+                li(T6, W)
+                E(rv_slt(T3, T1, T6), "")
+                Br(rv_beq, T3, _R_ZERO, skip, "")             # gj >= W
+                li(T3, Cin)
+                E(rv_mul(T3, n_reg, T3), "")
+                E(rv_add(T3, T3, ic_reg), "")
+                li(T6, H)
+                E(rv_mul(T3, T3, T6), "")
+                E(rv_add(T3, T3, T0), "")
+                li(T6, W)
+                E(rv_mul(T3, T3, T6), "")
+                E(rv_add(T3, T3, T1), "")
+                E(rv_slli(T3, T3, 2), "")
+                E(rv_add(T3, base_in, T3), "")
+                E(rv_lw(T2, T3, 0), "")
+                L(skip)
+                E(rv_sw(base_d, T2, 4 * (r * 4 + c)), "")
+
+        # ── input transform: vbuf = B^T dbuf B (signed sums of dbuf) ───
+        for i in range(4):
+            for j in range(4):
+                E(rv_addi(T2, _R_ZERO, 0), "")
+                for a in range(4):
+                    for b in range(4):
+                        coef = BT[i][a] * Bm[b][j]
+                        if coef == 0:
+                            continue
+                        E(rv_lw(T0, base_d, 4 * (a * 4 + b)), "")
+                        E(rv_add(T2, T2, T0) if coef > 0 else rv_sub(T2, T2, T0), "")
+                E(rv_sw(base_v, T2, 4 * (i * 4 + j)), "")
+
+        # ── Winograd-domain MAC: acc[p] += (U[oc,ic,p] * V[p]) >> 16 ───
+        li(T0, Cin)
+        E(rv_mul(T0, oc_reg, T0), "")
+        E(rv_add(T0, T0, ic_reg), "")
+        E(rv_slli(T0, T0, 6), "((oc*Cin+ic)*16)*4")
+        E(rv_add(T0, base_u, T0), "&U[oc,ic,0]")
+        for p in range(16):
+            E(rv_lw(T1, T0, 4 * p), "")
+            E(rv_lw(T2, base_v, 4 * p), "")
+            # Full-precision Q16.16 multiply: (U*V) >> 16 using MULH+MUL.
+            # Winograd intermediates (V, U) can exceed 2^15, so the low-32
+            # MUL + SRAI used elsewhere would wrap; the 64-bit product >>16
+            # stays in range and matches the ideal reference.
+            E(rv_mul(T6, T1, T2), "mul lo")
+            E(rv_mulh(T1, T1, T2), "mul hi")
+            E(rv_srli(T6, T6, 16), "logical >>16 (low word can be negative)")
+            E(rv_slli(T1, T1, 16), "")
+            E(rv_or(T1, T1, T6), "(U*V)>>16")
+            E(rv_lw(T6, base_acc, 4 * p), "")
+            E(rv_add(T6, T6, T1), "")
+            E(rv_sw(base_acc, T6, 4 * p), "")
+
+        E(rv_addi(ic_reg, ic_reg, 1), "ic++")
+        li(T6, Cin)
+        E(rv_slt(T3, ic_reg, T6), "")
+        Br(rv_bne, T3, _R_ZERO, "_wg_ic_loop", "loop ic")
+
+        # ── output transform Y = A^T acc A, + bias, store in-bounds ────
+        for oy in range(2):
+            for ox in range(2):
+                E(rv_addi(T2, _R_ZERO, 0), "")
+                for a in range(4):
+                    for b in range(4):
+                        coef = AT[oy][a] * AT[ox][b]
+                        if coef == 0:
+                            continue
+                        E(rv_lw(T0, base_acc, 4 * (a * 4 + b)), "")
+                        E(rv_add(T2, T2, T0) if coef > 0 else rv_sub(T2, T2, T0), "")
+                if b_name is not None:
+                    E(rv_slli(T3, oc_reg, 2), "")
+                    E(rv_add(T3, base_bias, T3), "")
+                    E(rv_lw(T0, T3, 0), "bias[oc]")
+                    E(rv_add(T2, T2, T0), "")
+                # bounds: oh = 2*ti+oy < H, ow = 2*tj+ox < W
+                oskip = f"_wg_oskip_{oy}_{ox}"
+                E(rv_slli(T0, ti_reg, 1), "")
+                E(rv_addi(T0, T0, oy), "oh")
+                li(T6, H)
+                E(rv_slt(T3, T0, T6), "")
+                Br(rv_beq, T3, _R_ZERO, oskip, "")
+                E(rv_slli(T1, tj_reg, 1), "")
+                E(rv_addi(T1, T1, ox), "ow")
+                li(T6, W)
+                E(rv_slt(T3, T1, T6), "")
+                Br(rv_beq, T3, _R_ZERO, oskip, "")
+                li(T3, Cout)
+                E(rv_mul(T3, n_reg, T3), "")
+                E(rv_add(T3, T3, oc_reg), "")
+                li(T6, H)
+                E(rv_mul(T3, T3, T6), "")
+                E(rv_add(T3, T3, T0), "")
+                li(T6, W)
+                E(rv_mul(T3, T3, T6), "")
+                E(rv_add(T3, T3, T1), "")
+                E(rv_slli(T3, T3, 2), "")
+                E(rv_add(T3, base_out, T3), "")
+                E(rv_sw(T3, T2, 0), "")
+                L(oskip)
+
+        E(rv_addi(tj_reg, tj_reg, 1), "tj++")
+        li(T6, TW)
+        E(rv_slt(T3, tj_reg, T6), "")
+        Br(rv_bne, T3, _R_ZERO, "_wg_tj_loop", "loop tj")
+
+        E(rv_addi(ti_reg, ti_reg, 1), "ti++")
+        li(T6, TH)
+        E(rv_slt(T3, ti_reg, T6), "")
+        Br(rv_bne, T3, _R_ZERO, "_wg_ti_loop", "loop ti")
+
+        E(rv_addi(oc_reg, oc_reg, 1), "oc++")
+        li(T6, Cout)
+        E(rv_slt(T3, oc_reg, T6), "")
+        Br(rv_bne, T3, _R_ZERO, "_wg_oc_loop", "loop oc")
+
+        E(rv_addi(n_reg, n_reg, 1), "n++")
+        li(T6, N)
+        E(rv_slt(T3, n_reg, T6), "")
+        Br(rv_bne, T3, _R_ZERO, "_wg_n_loop", "loop n")
+
+        L("_wg_done")
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Part 8: Main Pipeline
 # ═══════════════════════════════════════════════════════════════════════════
+
+
+def _emit_platform_fwht() -> str:
+    """Size-independent FWHT kernel (platform ABI: a0=in, a1=out, a2=N)."""
+    lines = [
+        "# ScratchV platform kernel: FWHT (size-independent, a2 = N)",
+        "    .option norelax",
+        "    .text",
+        "    .globl cnn_entry",
+        "    .type cnn_entry, @function",
+        "cnn_entry:",
+        "    mv   t0, a0                 # src = in",
+        "    mv   t1, a1                 # dst = out",
+        "    mv   t2, a2                 # N",
+        "    mv   t3, zero               # i",
+        "_p_fwht_copy:",
+        "    lw   t4, 0(t0)",
+        "    sw   t4, 0(t1)",
+        "    addi t0, t0, 4",
+        "    addi t1, t1, 4",
+        "    addi t3, t3, 1",
+        "    blt  t3, t2, _p_fwht_copy",
+        "    li   t5, 1                  # length = 1",
+        "_p_fwht_len:",
+        "    bge  t5, t2, _p_fwht_done",
+        "    slli t6, t5, 1              # step = 2*length",
+        "    li   s2, 0                  # i = block start",
+        "_p_fwht_i:",
+        "    bge  s2, t2, _p_fwht_next_len",
+        "    li   s3, 0                  # j = 0",
+        "_p_fwht_j:",
+        "    bge  s3, t5, _p_fwht_next_block",
+        "    add  s4, s2, s3             # idx = i + j",
+        "    slli s5, s4, 2",
+        "    add  s6, a1, s5             # &a[idx]",
+        "    add  s7, s4, t5             # idx + length",
+        "    slli s7, s7, 2",
+        "    add  s8, a1, s7             # &a[idx+length]",
+        "    lw   s9, 0(s6)              # u",
+        "    lw   s10, 0(s8)             # v",
+        "    add  s11, s9, s10           # u+v",
+        "    sw   s11, 0(s6)",
+        "    sub  s11, s9, s10           # u-v",
+        "    sw   s11, 0(s8)",
+        "    addi s3, s3, 1",
+        "    j    _p_fwht_j",
+        "_p_fwht_next_block:",
+        "    add  s2, s2, t6",
+        "    j    _p_fwht_i",
+        "_p_fwht_next_len:",
+        "    slli t5, t5, 1",
+        "    j    _p_fwht_len",
+        "_p_fwht_done:",
+        "    ret",
+        "    .size cnn_entry, . - cnn_entry",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _emit_platform_conv() -> str:
+    """Size-independent direct Conv2D kernel (platform ABI).
+
+    a0 = input (NCHW), a1 = output (NCHW), a2 = param block
+    (N,C_in,H,W,C_out,K,pad,stride,H_out,W_out,w_ptr,b_ptr).
+    Semantics per docs/输入规范.md section 3.5.
+    """
+    lines = [
+        "# ScratchV platform kernel: direct Conv2D (size-independent)",
+        "    .option norelax",
+        "    .text",
+        "    .globl cnn_entry",
+        "    .type cnn_entry, @function",
+        "cnn_entry:",
+        "    lw   s0, 0(a2)              # N",
+        "    lw   s1, 4(a2)              # C_in",
+        "    lw   s2, 8(a2)              # H",
+        "    lw   s3, 12(a2)             # W",
+        "    lw   s4, 16(a2)             # C_out",
+        "    lw   s5, 20(a2)             # K",
+        "    lw   s6, 24(a2)             # pad",
+        "    lw   s7, 32(a2)             # H_out",
+        "    lw   s8, 36(a2)             # W_out",
+        "    lw   s9, 40(a2)             # w_ptr",
+        "    lw   s10, 44(a2)            # b_ptr",
+        "    mv   s11, a0                # in base",
+        "    mv   a7, a1                 # out base",
+        "    li   t0, 0                  # n = 0",
+        "_p_conv_n:",
+        "    bge  t0, s0, _p_conv_done",
+        "    li   t1, 0                  # oc = 0",
+        "_p_conv_oc:",
+        "    bge  t1, s4, _p_conv_next_n",
+        "    li   t2, 0                  # oh = 0",
+        "_p_conv_oh:",
+        "    bge  t2, s7, _p_conv_next_oc",
+        "    li   t3, 0                  # ow = 0",
+        "_p_conv_ow:",
+        "    bge  t3, s8, _p_conv_next_oh",
+        "    li   t6, 0                  # acc = 0",
+        "    beq  s10, zero, _p_conv_nobias",
+        "    slli a3, t1, 2",
+        "    add  a3, s10, a3",
+        "    lw   t6, 0(a3)              # acc = bias[oc]",
+        "_p_conv_nobias:",
+        "    li   t4, 0                  # ic = 0",
+        "_p_conv_ic:",
+        "    bge  t4, s1, _p_conv_store",
+        "    li   t5, 0                  # kh = 0",
+        "_p_conv_kh:",
+        "    bge  t5, s5, _p_conv_next_ic",
+        "    li   a6, 0                  # kw = 0",
+        "_p_conv_kw:",
+        "    bge  a6, s5, _p_conv_next_kh",
+        "    add  a3, t2, t5",
+        "    sub  a3, a3, s6             # ih",
+        "    add  a4, t3, a6",
+        "    sub  a4, a4, s6             # iw",
+        "    blt  a3, zero, _p_conv_kw_skip",
+        "    bge  a3, s2, _p_conv_kw_skip",
+        "    blt  a4, zero, _p_conv_kw_skip",
+        "    bge  a4, s3, _p_conv_kw_skip",
+        "    mul  a5, t0, s1",
+        "    add  a5, a5, t4",
+        "    mul  a5, a5, s2",
+        "    add  a5, a5, a3",
+        "    mul  a5, a5, s3",
+        "    add  a5, a5, a4",
+        "    slli a5, a5, 2",
+        "    add  a5, s11, a5",
+        "    lw   a5, 0(a5)              # in value",
+        "    mul  a4, t1, s1",
+        "    add  a4, a4, t4",
+        "    mul  a4, a4, s5",
+        "    add  a4, a4, t5",
+        "    mul  a4, a4, s5",
+        "    add  a4, a4, a6",
+        "    slli a4, a4, 2",
+        "    add  a4, s9, a4",
+        "    lw   a4, 0(a4)              # weight value",
+        "    mul  a5, a5, a4",
+        "    srai a5, a5, 16",
+        "    add  t6, t6, a5             # acc += prod",
+        "_p_conv_kw_skip:",
+        "    addi a6, a6, 1",
+        "    j    _p_conv_kw",
+        "_p_conv_next_kh:",
+        "    addi t5, t5, 1",
+        "    j    _p_conv_kh",
+        "_p_conv_next_ic:",
+        "    addi t4, t4, 1",
+        "    j    _p_conv_ic",
+        "_p_conv_store:",
+        "    mul  a3, t0, s4",
+        "    add  a3, a3, t1",
+        "    mul  a3, a3, s7",
+        "    add  a3, a3, t2",
+        "    mul  a3, a3, s8",
+        "    add  a3, a3, t3",
+        "    slli a3, a3, 2",
+        "    add  a3, a7, a3",
+        "    sw   t6, 0(a3)",
+        "    addi t3, t3, 1",
+        "    j    _p_conv_ow",
+        "_p_conv_next_oh:",
+        "    addi t2, t2, 1",
+        "    j    _p_conv_oh",
+        "_p_conv_next_oc:",
+        "    addi t1, t1, 1",
+        "    j    _p_conv_oc",
+        "_p_conv_next_n:",
+        "    addi t0, t0, 1",
+        "    j    _p_conv_n",
+        "_p_conv_done:",
+        "    ret",
+        "    .size cnn_entry, . - cnn_entry",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _emit_platform_spmm() -> str:
+    """Size-independent CSR SpMM kernel (platform ABI).
+
+    a0 = CSR block (values_ptr, col_ptr, row_ptr), a1 = out (M*N), a2 = params
+    (M, K, N, nnz, B_ptr). Semantics per docs/输入规范.md section 4.5.
+    """
+    lines = [
+        "# ScratchV platform kernel: CSR SpMM (size-independent)",
+        "    .option norelax",
+        "    .text",
+        "    .globl cnn_entry",
+        "    .type cnn_entry, @function",
+        "cnn_entry:",
+        "    lw   t2, 0(a0)              # values_ptr",
+        "    lw   t3, 4(a0)              # col_ptr",
+        "    lw   t4, 8(a0)              # row_ptr",
+        "    lw   t5, 0(a2)              # M",
+        "    lw   t6, 8(a2)              # N",
+        "    lw   s2, 16(a2)             # B_ptr",
+        "    mv   a0, t2                 # values",
+        "    mv   a2, t3                 # col",
+        "    mv   a3, t4                 # row_ptr",
+        "    mv   a4, t5                 # M",
+        "    mv   a5, t6                 # N",
+        "    mv   a6, s2                 # B",
+        "    li   s3, 0                  # i = 0",
+        "_p_spmm_i:",
+        "    bge  s3, a4, _p_spmm_done",
+        "    slli t0, s3, 2",
+        "    add  t0, a3, t0             # &row_ptr[i]",
+        "    lw   s5, 0(t0)              # j = row_ptr[i]",
+        "    lw   s6, 4(t0)              # j_end = row_ptr[i+1]",
+        "    li   s4, 0                  # n = 0",
+        "_p_spmm_zero:",
+        "    mul  t0, s3, a5",
+        "    add  t0, t0, s4",
+        "    slli t0, t0, 2",
+        "    add  t0, a1, t0",
+        "    sw   zero, 0(t0)",
+        "    addi s4, s4, 1",
+        "    blt  s4, a5, _p_spmm_zero",
+        "_p_spmm_j:",
+        "    bge  s5, s6, _p_spmm_next_i",
+        "    slli t1, s5, 2",
+        "    add  t1, a0, t1",
+        "    lw   t1, 0(t1)              # a = values[j]",
+        "    slli t0, s5, 2",
+        "    add  t0, a2, t0",
+        "    lw   t0, 0(t0)              # k = col[j]",
+        "    li   s4, 0                  # n = 0",
+        "_p_spmm_n:",
+        "    mul  t2, t0, a5",
+        "    add  t2, t2, s4",
+        "    slli t2, t2, 2",
+        "    add  t2, a6, t2",
+        "    lw   t2, 0(t2)              # B[k,n]",
+        "    mul  t2, t1, t2",
+        "    srai t2, t2, 16",
+        "    mul  t3, s3, a5",
+        "    add  t3, t3, s4",
+        "    slli t3, t3, 2",
+        "    add  t3, a1, t3",
+        "    lw   t4, 0(t3)",
+        "    add  t4, t4, t2",
+        "    sw   t4, 0(t3)",
+        "    addi s4, s4, 1",
+        "    blt  s4, a5, _p_spmm_n",
+        "    addi s5, s5, 1",
+        "    j    _p_spmm_j",
+        "_p_spmm_next_i:",
+        "    addi s3, s3, 1",
+        "    j    _p_spmm_i",
+        "_p_spmm_done:",
+        "    ret",
+        "    .size cnn_entry, . - cnn_entry",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def emit_platform_asm(generator, weight_data: bytes, model=None) -> str:
+    """Render a platform-standard, clang-assemblable listing (``--platform-asm``).
+
+    If *model* is a single size-independent-supported problem node (currently
+    FWHT), emit the dedicated runtime-sized kernel; otherwise emit the
+    fixed-shape standard listing (B-1).
+    """
+    if model is not None and len(model.nodes) == 1 and model.nodes[0].op_type == "Fwht":
+        return _emit_platform_fwht()
+    if model is not None and len(model.nodes) == 1 and model.nodes[0].op_type == "SpmmCsr":
+        return _emit_platform_spmm()
+    if model is not None and len(model.nodes) == 1 and model.nodes[0].op_type == "Conv":
+        return _emit_platform_conv()
+    return _emit_platform_listing(generator, weight_data)
+
+
+def _emit_platform_listing(generator, weight_data: bytes) -> str:
+    """Fixed-shape platform-standard listing (B-1).
+
+    Differences from the default debug listing:
+      - global entry symbol ``cnn_entry`` (not ``_start``);
+      - branch/jump targets are real labels (not numeric offsets);
+      - the ``_init_data_base`` placeholder pair becomes ``la gp, __data_start``;
+      - weights/constants are emitted inline as ``.word`` in a ``.data`` section
+        (no ``.incbin`` / ``.include``), preceded by ``__data_start``.
+
+    Platform contract: a0 = input base, a1 = output base, a2 = size scalar;
+    sp is already set by the caller.
+    """
+    import re as _re
+
+    emit = generator.emit
+    dis = emit.disassemble(symbolic=True).splitlines()
+
+    # Prefer the emitter's own label names; else a generated .Lpc_<idx>.
+    idx_to_name: dict[int, str] = {}
+    for name, idx in emit.labels.items():
+        if idx not in idx_to_name:
+            idx_to_name[idx] = name
+
+    def label_for(idx: int) -> str:
+        if idx == 0:
+            return "cnn_entry"
+        return idx_to_name.get(idx, f".Lpc_{idx}")
+
+    out: list[str] = []
+    for line in dis:
+        stripped = line.strip()
+        if stripped.endswith(":") and stripped[:-1].startswith(".Lsv_"):
+            idx = int(stripped[len(".Lsv_"):-1])
+            out.append(f"{label_for(idx)}:")
+        else:
+            out.append(_re.sub(r"\.Lsv_(\d+)", lambda m: label_for(int(m.group(1))), line))
+
+    # Replace the auipc/addi placeholder pair with a standard la.
+    fixed: list[str] = []
+    skip_next = False
+    for line in out:
+        if skip_next:
+            skip_next = False
+            continue
+        if "auipc gp, 0x0" in line:
+            indent = line[: len(line) - len(line.lstrip())]
+            fixed.append(f"{indent}la gp, __data_start      # data section base")
+            skip_next = True  # drop the following addi/mv placeholder
+            continue
+        fixed.append(line)
+
+    header = [
+        "# Generated by ScratchV standalone --platform-asm",
+        "# Platform contract: a0=input base, a1=output base, a2=size; sp preset.",
+        "# Assemble: clang -march=rv32im -mabi=ilp32 -nostdlib -c this.s",
+        "",
+        "    .option norelax",
+        "    .text",
+        "    .globl cnn_entry",
+        "    .type cnn_entry, @function",
+    ]
+    tail = ["    .size cnn_entry, . - cnn_entry", ""]
+
+    data_lines = ["", "    .data", "    .balign 4", "__data_start:"]
+    if weight_data:
+        words = struct.unpack(f"<{len(weight_data) // 4}I", weight_data)
+        for i in range(0, len(words), 8):
+            chunk = ", ".join(f"0x{w:08x}" for w in words[i:i + 8])
+            data_lines.append(f"    .word {chunk}")
+    else:
+        data_lines.append("    .word 0")
+
+    return "\n".join(header + fixed + tail + data_lines) + "\n"
 
 
 def patch_gp_data_base(
@@ -2732,6 +3743,7 @@ def convert_onnx_to_riscv(
     metadata: dict | None = None,
     llvm_mca: str | None = None,
     symbolic_asm: bool = False,
+    platform_asm: bool = False,
 ) -> int:
     """Full pipeline: ONNX model → RISC-V RV32IM binary.
 
@@ -2762,6 +3774,7 @@ def convert_onnx_to_riscv(
 
     # ── Step 2: Layout weights and plan memory ─────────────────────────
     print("\n[2/5] Converting weights to Q16.16 fixed-point and planning memory...")
+    _prepare_winograd_kernels(model)   # fold WinogradConv 3x3 kernels (if any)
     memory = MemoryPlan()
     weight_data = memory.layout_weights(model.initializers)
     print(f"  Weight data: {memory.data_size:,} bytes ({memory.data_size/1024/1024:.1f} MB)")
@@ -2926,7 +3939,10 @@ def convert_onnx_to_riscv(
     print(f"  Binary: {output_bin} ({len(binary):,} bytes)")
 
     # Disassembly for verification
-    asm_text = generator.emit.disassemble(symbolic=schedule or symbolic_asm)
+    if platform_asm:
+        asm_text = emit_platform_asm(generator, weight_data, model)
+    else:
+        asm_text = generator.emit.disassemble(symbolic=schedule or symbolic_asm)
     asm_path = output_asm or output_bin.replace(".bin", ".s")
     with open(asm_path, "w") as f:
         f.write(asm_text)
@@ -3113,6 +4129,10 @@ def main() -> int:
                         help="Schedule physical-register instructions before writing the binary")
     parser.add_argument("--symbolic-asm", action="store_true",
                         help="Emit reassemblable symbolic targets for scheduling analysis")
+    parser.add_argument("--platform-asm", action="store_true",
+                        help="Emit platform-standard assembly: global entry cnn_entry, "
+                             "label branch targets, inline .word weights, la gp (clang-"
+                             "assemblable, -march=rv32im -nostdlib)")
     parser.add_argument(
         "--uarch", default="basic", choices=["single", "fast", "basic", "slow"],
         help="Microarchitecture profile for cycle-accurate emulation: "
@@ -3154,6 +4174,7 @@ def main() -> int:
         const_merge=args.const_merge,
         schedule=args.schedule,
         symbolic_asm=args.symbolic_asm,
+        platform_asm=args.platform_asm,
     )
 
 
