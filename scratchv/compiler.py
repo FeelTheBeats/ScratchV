@@ -96,6 +96,9 @@ class CompilerConfig:
     disabled_passes: tuple[str, ...] = ()
     verify_ir: bool = False
     max_tensor_workspace_bytes: int = 256 * 1024 * 1024
+    # Phase 3 (optional): emit a self-contained FP32/rv32imf platform listing
+    # by reusing the verified standalone kernels instead of lowering IR.
+    platform_asm: bool = False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -501,6 +504,10 @@ class CompilerDriver:
 
     def _generate_code(self, program) -> str:
         """Run code generation (instruction selection + regalloc + emit)."""
+        if self.config.platform_asm:
+            from scratchv.backend.platform_emit import generate_platform_asm
+
+            return generate_platform_asm(program)
         if self.config.backend == "ir":
             from scratchv.ir.printer import IRPrinter
 

@@ -53,6 +53,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--tensor-workspace-mib", type=int, default=256,
         help="Maximum static workspace for tensor-c (default: 256 MiB)",
     )
+    parser.add_argument(
+        "--platform-asm",
+        action="store_true",
+        help="Emit a size-independent FP32/rv32imf platform .s (single op) "
+             "by reusing the verified standalone kernels",
+    )
 
     # ── Register allocation ─────────────────────────────────────────────
     parser.add_argument(
@@ -200,6 +206,7 @@ def args_to_config(args: argparse.Namespace) -> CompilerConfig:
         verify=args.verify,
         verify_ir=args.verify_ir,
         max_tensor_workspace_bytes=args.tensor_workspace_mib * 1024 * 1024,
+        platform_asm=args.platform_asm,
         rtol=args.rtol,
         atol=args.atol,
         use_logger=args.log_level is not None,
