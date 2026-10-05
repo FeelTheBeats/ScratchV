@@ -169,6 +169,22 @@ def test_actual_git_baseline_and_dirty_snapshot_are_isolated(tmp_path):
     assert (tmp_path / "report.html").is_file() and (tmp_path / "report.md").is_file()
 
 
+def test_missing_baseline_commit_is_fetched_from_origin(monkeypatch):
+    calls = []
+
+    def fake_git(*arguments, binary=False):
+        calls.append(arguments)
+        if arguments[0] == "rev-parse":
+            if not any(call[0] == "fetch" for call in calls):
+                raise subprocess.CalledProcessError(128, ["git", *arguments])
+            return bench.BASELINE
+        return ""
+
+    monkeypatch.setattr(bench, "git", fake_git)
+    assert bench.resolve_commit(bench.BASELINE) == bench.BASELINE
+    assert ("fetch", "--depth=1", "origin", bench.BASELINE) in calls
+
+
 def test_worker_timeout_is_visible_in_new_report(tmp_path, monkeypatch):
     actual_run = subprocess.run
 

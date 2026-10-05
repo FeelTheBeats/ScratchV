@@ -48,9 +48,23 @@ def git(*arguments, binary=False):
     return result.stdout if binary else result.stdout.decode("utf-8").strip()
 
 
+def resolve_commit(ref):
+    """Resolve ref to a commit, fetching it from origin when the clone lacks it.
+
+    CI copies a depth-1 mirror, so a pinned baseline that is still reachable
+    from origin is not necessarily present locally. Fetch the object on demand
+    instead of failing the whole comparison.
+    """
+    try:
+        return git("rev-parse", "--verify", "--end-of-options", ref + "^{commit}")
+    except subprocess.CalledProcessError:
+        git("fetch", "--depth=1", "origin", ref)
+        return git("rev-parse", "--verify", "--end-of-options", ref + "^{commit}")
+
+
 def snapshots(work, baseline_ref):
     from benchmarks.onnx_operator_worker import source_hash
-    commit = git("rev-parse", "--verify", "--end-of-options", baseline_ref + "^{commit}")
+    commit = resolve_commit(baseline_ref)
     before, after = work / "before", work / "after"
     before.mkdir()
     archive = git("archive", "--format=zip", commit, "scratchv", binary=True)
