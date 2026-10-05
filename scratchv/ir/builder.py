@@ -262,6 +262,24 @@ class IRBuilder:
                    trans_a=trans_a, trans_b=trans_b)
         return dest
 
+    def fwht(self, x: Value, direction: str = "forward") -> Value:
+        dest = self.make_value(dtype=x.dtype)
+        self._emit(OpCode.FWHT, dest, [x], direction=direction)
+        return dest
+
+    def spmm_csr(self, values: Value, col: Value, rowptr: Value,
+                 b: Value) -> Value:
+        dest = self.make_value(dtype=values.dtype)
+        self._emit(OpCode.SPMM_CSR, dest, [values, col, rowptr, b])
+        return dest
+
+    def winograd_conv(self, x: Value, u: Value, cout: int = 0,
+                      cin: int = 0, bias: Value | None = None) -> Value:
+        operands = [x, u] + ([bias] if bias is not None else [])
+        dest = self.make_value(dtype=x.dtype)
+        self._emit(OpCode.WINOGRAD_CONV, dest, operands, cout=cout, cin=cin)
+        return dest
+
     def sigmoid(self, val: Value) -> Value:
         dest = self.make_value(dtype=val.dtype)
         self._emit(OpCode.SIGMOID, dest, [val])

@@ -349,6 +349,9 @@ _SIGNATURE_GROUPS = [
     ((O.BR, O.ENDFOR), (0, 0, False, None)),
     ((O.BR_IF,), (1, 2, False, None)),
     ((O.RETURN,), (0, 1, False, None)),
+    ((O.FWHT,), (1, 1, True, "T")),
+    ((O.WINOGRAD_CONV,), (2, 3, True, "T")),
+    ((O.SPMM_CSR,), (4, 4, True, None)),
 ]
 _EXPECTED_SIGNATURES = {
     opcode: signature for opcodes, signature in _SIGNATURE_GROUPS for opcode in opcodes
@@ -362,6 +365,10 @@ def signature_program(opcode, dtype=None):
     operands = [literal(1, dtype, f"c{i}") for i in range(minimum)]
     if opcode == O.GATHER:
         operands[1] = literal(0, D.INT64, "index")
+    if opcode == O.SPMM_CSR:
+        # values/B share dtype; col/rowptr are integer CSR indices.
+        operands[1] = literal(0, D.INT64, "col")
+        operands[2] = literal(0, D.INT64, "rowptr")
     dest = V("result", dtype) if has_dest else None
     inst = I(opcode, dest, operands, attrs={"value": 1, "start": 0, "end": 2, "step": 1})
     inst.target = "exit,exit" if opcode == O.BR_IF else "exit" if opcode == O.BR else None

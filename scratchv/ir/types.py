@@ -60,6 +60,10 @@ class OpCode(enum.Enum):
     SLICE = "slice"
     UNSQUEEZE = "unsqueeze"
     EXPAND = "expand"
+    # Standalone-verified operators promoted to first-class IR opcodes.
+    FWHT = "fwht"
+    WINOGRAD_CONV = "winograd_conv"
+    SPMM_CSR = "spmm_csr"
 
     def is_arith(self) -> bool:
         return self in (OpCode.ADD, OpCode.SUB, OpCode.MUL, OpCode.DIV, OpCode.POW)
@@ -78,6 +82,9 @@ class OpCode(enum.Enum):
             OpCode.SIGMOID,
             OpCode.SQRT,
             OpCode.REDUCE_MEAN,
+            OpCode.FWHT,
+            OpCode.WINOGRAD_CONV,
+            OpCode.SPMM_CSR,
         )
 
     def is_control_flow(self) -> bool:

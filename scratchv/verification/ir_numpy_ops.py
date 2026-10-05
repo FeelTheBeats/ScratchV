@@ -119,6 +119,8 @@ def check_instruction(instr: Instruction):
         "stride",
         "padding",
         "out_channels",
+        "cout",
+        "cin",
     ):
         if key in instr.attrs:
             integer(instr.attrs[key], key)
@@ -562,3 +564,153 @@ def maxpool(xs, attrs, dtype):
                 axis=(-2, -1),
             )
     return output
+
+
+# ── Standalone-verified operators: Q16.16 on INT32, native on FLOAT32 ──────
+# One opcode dispatches on the destination dtype. INT32 carries Q16.16 and is
+# bit-exact against the standalone ``_gen_*`` generator; FLOAT32 is native
+# IEEE-754 and matches tensor-c / the platform kernels. Q16 is never inferred
+# from ``dtype == INT32`` outside these kernels (CSR indices are plain INT32).
+
+_WINO_F23_BT = ((1, 0, -1, 0), (0, 1, 1, 0), (0, -1, 1, 0), (0, 1, 0, -1))
+_WINO_F23_AT = ((1.0, 1.0, 1.0, 0.0), (0.0, 1.0, -1.0, -1.0))
+
+
+def _wrap32(v):
+    """Low-32-bit wrap, mirroring RV32 add/sub; returns int32."""
+    return (((np.asarray(v, np.int64) + (1 << 31)) % (1 << 32)) - (1 << 31)).astype(np.int32)
+
+
+def _srai16(v):
+    """RV32 SRAI: sign-extend the low 32 bits, arithmetic shift right by 16."""
+    return (np.asarray(v, np.int64).astype(np.int32) >> 16).astype(np.int32)
+
+
+@kernel(OpCode.FWHT, "direction")
+def fwht(xs, attrs, dtype):
+    x = xs[0]
+    count = int(x.size)
+    if count <= 0 or (count & (count - 1)):
+        raise OpError("ShapeError", "FWHT requires a power-of-two element count")
+    direction = attrs.get("direction", "forward")
+    if direction not in ("forward", "inverse"):
+        raise OpError("AttributeError", "FWHT direction must be forward/inverse")
+    shift = count.bit_length() - 1
+
+    if np.issubdtype(dtype, np.integer):
+        a = x.astype(np.int64).reshape(-1).copy()
+        length = 1
+        while length < count:
+            for i in range(0, count, 2 * length):
+                for j in range(length):
+                    u, v = a[i + j], a[i + j + length]
+                    a[i + j], a[i + j + length] = _wrap32(u + v), _wrap32(u - v)
+            length <<= 1
+        if direction == "inverse" and shift:
+            a >>= shift
+        return a.astype(dtype).reshape(x.shape)
+
+    a = x.astype(np.float32).reshape(-1).copy()
+    length = 1
+    while length < count:
+        for i in range(0, count, 2 * length):
+            for j in range(length):
+                u, v = a[i + j], a[i + j + length]
+                a[i + j], a[i + j + length] = np.float32(u + v), np.float32(u - v)
+        length <<= 1
+    if direction == "inverse" and shift:
+        a = (a / np.float32(count)).astype(np.float32)
+    return a.reshape(x.shape)
+
+
+@kernel(OpCode.SPMM_CSR)
+def spmm_csr(xs, attrs, dtype):
+    values, col, rowptr, b = xs
+    if values.dtype != b.dtype:
+        raise OpError("DTypeError", "SPMM_CSR values and B must share a dtype")
+    if col.dtype.kind not in "iu" or rowptr.dtype.kind not in "iu":
+        raise OpError("DTypeError", "SPMM_CSR col/rowptr must be integer")
+    if b.ndim < 1:
+        raise OpError("ShapeError", "SPMM_CSR B must be at least 1-D")
+    k = int(b.shape[0])
+    m = int(rowptr.size) - 1
+    n = int(b.shape[1]) if b.ndim >= 2 else 1
+    if values.size != col.size:
+        raise OpError("ShapeError", "SPMM_CSR values/col length mismatch")
+    if rowptr.size != m + 1 or m < 0:
+        raise OpError("ShapeError", "SPMM_CSR rowptr must have M+1 entries")
+    if np.any(col < 0) or np.any(col >= k):
+        raise OpError("IndexError", "SPMM_CSR column index out of range")
+    if np.any(rowptr < 0) or np.any(rowptr > values.size):
+        raise OpError("IndexError", "SPMM_CSR rowptr out of range")
+    b = b.reshape(k, n)
+    out = np.zeros((m, n), dtype=dtype)
+    integer = np.issubdtype(dtype, np.integer)
+    for i in range(m):
+        lo, hi = int(rowptr[i]), int(rowptr[i + 1])
+        if hi < lo:
+            raise OpError("IndexError", "SPMM_CSR rowptr must be nondecreasing")
+        for j in range(lo, hi):
+            kk = int(col[j])
+            if integer:
+                a = int(values[j])
+                for c in range(n):
+                    out[i, c] = _wrap32(int(out[i, c]) + int(_srai16(_wrap32(a * int(b[kk, c])))))
+            else:
+                out[i, :] += values[j] * b[kk, :]
+    return out
+
+
+@kernel(OpCode.WINOGRAD_CONV, "cout", "cin")
+def winograd_conv(xs, attrs, dtype):
+    x, u = xs[0], xs[1]
+    bias = xs[2] if len(xs) == 3 else None
+    if x.ndim != 4 or u.ndim != 4 or tuple(u.shape[2:]) != (4, 4):
+        raise OpError("ShapeError", "WINOGRAD_CONV requires NCHW x and [Cout,Cin,4,4] U")
+    if x.shape[1] != u.shape[1]:
+        raise OpError("ShapeError", "WINOGRAD_CONV Cin disagrees between x and U")
+    batch, cin, height, width = (int(v) for v in x.shape)
+    cout = int(u.shape[0])
+    if attrs.get("cout", 0) and attrs["cout"] != cout:
+        raise OpError("AttributeError", "WINOGRAD_CONV cout disagrees with U")
+    if attrs.get("cin", 0) and attrs["cin"] != cin:
+        raise OpError("AttributeError", "WINOGRAD_CONV cin disagrees with x")
+    if bias is not None and bias.shape not in ((), (cout,)):
+        raise OpError("ShapeError", "WINOGRAD_CONV bias must be scalar or Cout")
+    tiles_h, tiles_w = (height + 1) // 2, (width + 1) // 2
+    integer = np.issubdtype(dtype, np.integer)
+    numpy_dtype = np.int64 if integer else np.float32
+    # The last tile starts at 2*(T-1) and reads four rows/cols, which for odd
+    # spatial sizes overruns H+2 by one; a H+3/W+3 zero border covers it exactly.
+    padded = np.zeros((batch, cin, height + 3, width + 3), numpy_dtype)
+    padded[:, :, 1:1 + height, 1:1 + width] = x
+    out = np.empty((batch, cout, height, width), dtype=dtype)
+    for nb in range(batch):
+        for oc in range(cout):
+            for ti in range(tiles_h):
+                for tj in range(tiles_w):
+                    acc = np.zeros((4, 4), numpy_dtype)
+                    for ic in range(cin):
+                        d = padded[nb, ic, 2 * ti:2 * ti + 4, 2 * tj:2 * tj + 4]
+                        v = np.zeros((4, 4), numpy_dtype)
+                        for a in range(4):
+                            for bb in range(4):
+                                v[a, bb] = sum(
+                                    _WINO_F23_BT[a][m] * _WINO_F23_BT[bb][j] * d[m, j]
+                                    for m in range(4) for j in range(4))
+                        for p in range(4):
+                            for q in range(4):
+                                if integer:
+                                    acc[p, q] += (np.int64(u[oc, ic, p, q]) * np.int64(v[p, q])) >> 16
+                                else:
+                                    acc[p, q] += u[oc, ic, p, q] * v[p, q]
+                    for oy in range(2):
+                        for ox in range(2):
+                            y = sum(_WINO_F23_AT[oy][a] * _WINO_F23_AT[ox][bb] * acc[a, bb]
+                                    for a in range(4) for bb in range(4))
+                            if bias is not None:
+                                y = y + (bias if bias.ndim == 0 else bias[oc])
+                            if 2 * ti + oy < height and 2 * tj + ox < width:
+                                out[nb, oc, 2 * ti + oy, 2 * tj + ox] = (
+                                    _wrap32(y) if integer else np.float32(y))
+    return out

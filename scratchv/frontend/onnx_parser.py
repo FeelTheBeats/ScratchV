@@ -18,6 +18,11 @@ class ONNXParseError(Exception):
     pass
 
 
+# Standard ONNX ops live in the default/ai.onnx domains; ScratchV's standalone
+# operators (Fwht/WinogradConv/SpmmCsr) use the org.scratchv domain.
+_SUPPORTED_DOMAINS = ("", "ai.onnx", "org.scratchv")
+
+
 class ONNXParser:
     """Parses an ONNX model file into an IR Program.
 
@@ -34,6 +39,7 @@ class ONNXParser:
         self._producers = {}
         self._constant_cache = {}
         self._base_dir = ""
+        self._winograd_u: dict[str, str] = {}
 
     def parse(self, model_path: str) -> Program:
         """Parse an ONNX model file and return an IR Program."""
@@ -52,11 +58,12 @@ class ONNXParser:
         self._producers = {}
         self._constant_cache = {}
         self._base_dir = str(Path(model_path).resolve().parent)
+        self._winograd_u = {}
         # Inspect/infer the graph before materializing external weights. This
         # avoids serializing a >2 GiB protobuf just to infer tensor shapes.
         model = onnx.load(model_path, load_external_data=False)
         domains = sorted({node.domain for node in model.graph.node
-                          if node.domain not in ("", "ai.onnx")})
+                          if node.domain not in _SUPPORTED_DOMAINS})
         if domains:
             raise ONNXParseError(f"Unsupported ONNX domains: {', '.join(domains)}")
         missing = sorted({
@@ -96,6 +103,12 @@ class ONNXParser:
             arr = onnx.numpy_helper.to_array(init, base_dir=self._base_dir)
             self._bind_constant(init.name, arr)
 
+        # Fold Winograd 3x3 kernels into the Winograd domain before translation.
+        # The synthesized U initializer is registered (and bound) here so the
+        # WinogradConv handler can resolve it; it must run after initializer
+        # binding and before the node loop below.
+        self._prepare_winograd_kernels(graph)
+
         # Map graph inputs to function params
         for inp in graph.input:
             if inp.name in self._value_map:
@@ -130,7 +143,7 @@ class ONNXParser:
     def _translate_node(self, node, output_names: set[str]) -> None:
         """Translate a single ONNX node to IR instructions."""
         op_type = node.op_type
-        if node.domain not in ("", "ai.onnx"):
+        if node.domain not in _SUPPORTED_DOMAINS:
             raise ONNXParseError(f"Unsupported ONNX domain: {node.domain}")
         inputs = [self._get_value(name) for name in node.input if name]
         outputs = node.output
@@ -191,6 +204,43 @@ class ONNXParser:
         if data.ndim == 0:
             self.builder.load_const(data.item(), dtype)
         return value
+
+    def _prepare_winograd_kernels(self, graph) -> None:
+        """Fold each WinogradConv 3x3 weight into U = G g G^T at parse time.
+
+        The folded tensor is registered as a new global initializer named
+        ``{weight}__wino23`` and recorded per output; the handler consumes it.
+        Reuses the standalone F(2,3) transform so U matches the verified
+        standalone pipeline bit-for-bit.
+        """
+        import numpy as np
+        import onnx
+        from scratchv.standalone.onnx_to_riscv_standalone import (
+            winograd_f23_kernel_transform,
+        )
+        for node in graph.node:
+            if node.op_type != "WinogradConv" or len(node.input) < 2 or not node.input[1]:
+                continue
+            w_name = node.input[1]
+            weight = self.initializers.get(w_name)
+            if weight is None:
+                init = next((t for t in graph.initializer if t.name == w_name), None)
+                if init is None:
+                    raise ONNXParseError(
+                        f"WinogradConv weight must be an initializer: {w_name}")
+                weight = onnx.numpy_helper.to_array(init, base_dir=self._base_dir)
+            if len(weight.shape) != 4 or tuple(weight.shape[2:]) != (3, 3):
+                raise ONNXParseError("WinogradConv currently supports 3x3 kernels only")
+            cout, cin = int(weight.shape[0]), int(weight.shape[1])
+            u_name = f"{w_name}__wino23"
+            if u_name not in self.initializers:
+                folded = np.empty((cout, cin, 4, 4), np.float32)
+                for oc in range(cout):
+                    for ic in range(cin):
+                        folded[oc, ic] = np.asarray(winograd_f23_kernel_transform(
+                            weight[oc, ic].astype(np.float32).tolist()), dtype=np.float32)
+                self._bind_constant(u_name, folded)
+            self._winograd_u[node.output[0]] = u_name
 
     def _constant_array(self, value: Value):
         """Resolve only shape/axis dependencies, not whole-model constant folding.
@@ -386,6 +436,54 @@ class ONNXParser:
             elif attr.name == "transB":
                 trans_b = attr.i != 0
         result = self.builder.gemm(a, w, b, trans_a, trans_b)
+        self._define_outputs(outputs, result)
+
+    def _handle_fwht(self, node, inputs: list[Value],
+                     outputs: list[str]) -> None:
+        x = inputs[0]
+        attrs = self._attributes(node)
+        direction = attrs.get("direction", "forward")
+        if isinstance(direction, bytes):
+            direction = direction.decode()
+        if direction not in ("forward", "inverse"):
+            raise ONNXParseError(
+                f"Fwht direction must be 'forward' or 'inverse', got {direction!r}")
+        shape = tuple(x.shape)
+        num_el = math.prod(shape) if shape else 0
+        if num_el <= 0 or (num_el & (num_el - 1)) != 0:
+            raise ONNXParseError(
+                f"Fwht requires a power-of-two element count, got {num_el}")
+        result = self.builder.fwht(x, direction=direction)
+        result.dtype, result.shape = x.dtype, shape
+        self._define_outputs(outputs, result)
+
+    def _handle_spmmcsr(self, node, inputs: list[Value],
+                        outputs: list[str]) -> None:
+        values, col, rowptr, b = inputs[0], inputs[1], inputs[2], inputs[3]
+        if values.shape and col.shape and values.shape[0] != col.shape[0]:
+            raise ONNXParseError("SpmmCsr values/col_indices length mismatch")
+        m = (int(rowptr.shape[0]) - 1) if rowptr.shape else 0
+        n = int(b.shape[1]) if len(b.shape) >= 2 else 1
+        result = self.builder.spmm_csr(values, col, rowptr, b)
+        result.dtype, result.shape = values.dtype, (m, n)
+        self._define_outputs(outputs, result)
+
+    def _handle_winogradconv(self, node, inputs: list[Value],
+                             outputs: list[str]) -> None:
+        x = inputs[0]
+        # Optional bias: empty input names are filtered, so check arity not index.
+        bias = inputs[2] if len(inputs) > 2 else None
+        u_name = self._winograd_u.get(outputs[0])
+        if u_name is None:
+            raise ONNXParseError(
+                f"WinogradConv missing pre-folded U for {outputs[0]}")
+        u = self._value_map[u_name]
+        if len(x.shape) != 4 or len(u.shape) != 4 or tuple(u.shape[2:]) != (4, 4):
+            raise ONNXParseError("WinogradConv expects NCHW x and [Cout,Cin,4,4] U")
+        batch, cin, height, width = x.shape
+        cout = int(u.shape[0])
+        result = self.builder.winograd_conv(x, u, cout=cout, cin=cin, bias=bias)
+        result.dtype, result.shape = x.dtype, (batch, cout, height, width)
         self._define_outputs(outputs, result)
 
     def _handle_sigmoid(self, node, inputs: list[Value],

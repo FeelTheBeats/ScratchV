@@ -81,6 +81,11 @@ OPCODE_SPECS.update({
     OpCode.RETURN: OpcodeSpec(0, 1, False),
     OpCode.FOR: OpcodeSpec(0, 0, True),
     OpCode.ENDFOR: OpcodeSpec(0, 0, False),
+    # FWHT/WINOGRAD keep a single dtype across operands and result; SPMM_CSR
+    # mixes float values with integer CSR indices, so it is validated below.
+    OpCode.FWHT: OpcodeSpec(1, 1, True, "T"),
+    OpCode.WINOGRAD_CONV: OpcodeSpec(2, 3, True, "T"),
+    OpCode.SPMM_CSR: OpcodeSpec(4, 4, True, None),
 })
 _RULES = {name: i for i, name in enumerate((
     "def-before-use", "label-existence", "block-termination", "type-consistency",
@@ -398,6 +403,22 @@ class IRVerifier:
                 error("gather-indices", "GATHER indices must be i32 or i64")
             if inst.dest is not None and inst.dest.dtype != data.dtype:
                 error("gather-result", "GATHER result dtype must match data dtype")
+        if inst.opcode == OpCode.SPMM_CSR:
+            values, col, rowptr, b = inst.operands
+            if values.dtype != b.dtype:
+                error("spmm-value-types", "SPMM_CSR values and B must share a dtype")
+            if col.dtype not in _INTS:
+                error("spmm-index", "SPMM_CSR col must be i32 or i64")
+            if rowptr.dtype not in _INTS:
+                error("spmm-index", "SPMM_CSR rowptr must be i32 or i64")
+            if inst.dest is not None and inst.dest.dtype != values.dtype:
+                error("spmm-result", "SPMM_CSR result dtype must match values")
+        if inst.opcode == OpCode.WINOGRAD_CONV:
+            bias = inst.operands[2] if count == 3 else None
+            cout = inst.attrs.get("cout")
+            if (bias is not None and isinstance(cout, int) and not isinstance(cout, bool)
+                    and cout > 0 and tuple(bias.shape) not in ((), (cout,))):
+                error("winograd-bias", "WINOGRAD_CONV bias shape must match cout or be scalar")
         if inst.opcode == OpCode.BR_IF:
             if count == 1:
                 if isinstance(inst.operands[0].dtype, DataType) and inst.operands[0].dtype not in _INTS:
