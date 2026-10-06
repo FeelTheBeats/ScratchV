@@ -96,6 +96,7 @@ class MachineOp(enum.Enum):
     FSW = "fsw"
     FMV_S = "fmv.s"
     FMV_S_X = "fmv.s.x"
+    FMV_W_X = "fmv.w.x"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

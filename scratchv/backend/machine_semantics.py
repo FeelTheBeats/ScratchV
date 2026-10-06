@@ -218,6 +218,7 @@ OP_SEM: dict[MachineOp, MachineOpSemantics] = {
         defs=(0,), uses=(1,), n_phys=2, is_pseudo=True
     ),
     MachineOp.FMV_S_X: _DEF_USE,
+    MachineOp.FMV_W_X: _DEF_USE,
 }
 
 

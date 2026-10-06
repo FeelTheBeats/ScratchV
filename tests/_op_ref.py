@@ -83,7 +83,7 @@ def spmm_ref_f32(values, col, rowptr, b, m, n) -> np.ndarray:
 
 def conv_direct_ref_q16(x_q, w_q, pad: int) -> np.ndarray:
     batch, channels, height, width = x_q.shape
-    cout = w_q.shape[0]
+    cout, _, kernel_h, kernel_w = w_q.shape
     padded = np.pad(x_q, ((0, 0), (0, 0), (pad, pad), (pad, pad)))
     out = np.zeros((batch, cout, height, width), dtype=np.int64)
     for nb in range(batch):
@@ -92,8 +92,8 @@ def conv_direct_ref_q16(x_q, w_q, pad: int) -> np.ndarray:
                 for ow in range(width):
                     acc = 0
                     for ic in range(channels):
-                        for kh in range(3):
-                            for kw in range(3):
+                        for kh in range(kernel_h):
+                            for kw in range(kernel_w):
                                 prod = srai16(
                                     int(padded[nb, ic, oh + kh, ow + kw])
                                     * int(w_q[oc, ic, kh, kw]))
@@ -104,7 +104,7 @@ def conv_direct_ref_q16(x_q, w_q, pad: int) -> np.ndarray:
 
 def conv_direct_ref_f32(x, w, pad: int) -> np.ndarray:
     batch, channels, height, width = x.shape
-    cout = w.shape[0]
+    cout, _, kernel_h, kernel_w = w.shape
     padded = np.pad(x, ((0, 0), (0, 0), (pad, pad), (pad, pad)))
     out = np.zeros((batch, cout, height, width), dtype=np.float32)
     for nb in range(batch):
@@ -113,8 +113,8 @@ def conv_direct_ref_f32(x, w, pad: int) -> np.ndarray:
                 for ow in range(width):
                     acc = np.float32(0.0)
                     for ic in range(channels):
-                        for kh in range(3):
-                            for kw in range(3):
+                        for kh in range(kernel_h):
+                            for kw in range(kernel_w):
                                 acc = np.float32(
                                     acc + np.float32(padded[nb, ic, oh + kh, ow + kw]
                                                      * w[oc, ic, kh, kw]))

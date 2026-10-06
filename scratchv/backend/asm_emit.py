@@ -74,6 +74,7 @@ _OP_NAMES = {
     MachineOp.FSW: "fsw",
     MachineOp.FMV_S: "fmv.s",
     MachineOp.FMV_S_X: "fmv.s.x",
+    MachineOp.FMV_W_X: "fmv.w.x",
 }
 
 
