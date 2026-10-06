@@ -62,6 +62,12 @@ OP_SEM: dict[MachineOp, MachineOpSemantics] = {
     MachineOp.SRAI: MachineOpSemantics(
         defs=(0,), uses=(1,), immediate_positions=(2,), n_phys=2
     ),
+    MachineOp.SLLI: MachineOpSemantics(
+        defs=(0,), uses=(1,), immediate_positions=(2,), n_phys=2
+    ),
+    MachineOp.SRLI: MachineOpSemantics(
+        defs=(0,), uses=(1,), immediate_positions=(2,), n_phys=2
+    ),
     MachineOp.XOR: _DEF_USE_USE,
     MachineOp.AND: _DEF_USE_USE,
     MachineOp.SLT: _DEF_USE_USE,
@@ -120,6 +126,11 @@ OP_SEM: dict[MachineOp, MachineOpSemantics] = {
         immediate_positions=(2,),
         is_terminator=True,
         n_phys=2,
+    ),
+    # ret -> jalr x0, 0(ra); emitted verbatim by the assembler.
+    MachineOp.RET: MachineOpSemantics(
+        is_terminator=True,
+        implicit_uses=frozenset({"ra"}),
     ),
     MachineOp.JAL: MachineOpSemantics(
         defs=(0,),

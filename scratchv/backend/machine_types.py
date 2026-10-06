@@ -34,6 +34,8 @@ class MachineOp(enum.Enum):
     DIV = "div"
     MAX = "max"     # pseudo: max rd, rs1, rs2
     SRAI = "srai"
+    SLLI = "slli"
+    SRLI = "srli"
     XOR = "xor"
     AND = "and"
     SLT = "slt"
@@ -47,6 +49,7 @@ class MachineOp(enum.Enum):
     J = "j"
     JAL = "jal"
     JALR = "jalr"
+    RET = "ret"     # pseudo: jalr x0, 0(ra)
     BEQ = "beq"
     BNE = "bne"
     BLT = "blt"

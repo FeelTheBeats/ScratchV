@@ -23,6 +23,8 @@ _OP_NAMES = {
     MachineOp.DIV: "div",
     MachineOp.MAX: "max",
     MachineOp.SRAI: "srai",
+    MachineOp.SLLI: "slli",
+    MachineOp.SRLI: "srli",
     MachineOp.XOR: "xor",
     MachineOp.AND: "and",
     MachineOp.SLT: "slt",
@@ -34,6 +36,7 @@ _OP_NAMES = {
     MachineOp.J: "j",
     MachineOp.JAL: "jal",
     MachineOp.JALR: "jalr",
+    MachineOp.RET: "ret",
     MachineOp.BEQ: "beq",
     MachineOp.BNE: "bne",
     MachineOp.BLT: "blt",
@@ -161,6 +164,14 @@ class AsmEmitter:
                 f"  sw {_fmt_op(instr.dst)}, {address}"
                 f"{_comment_suffix(instr)}"
             )
+
+        if instr.op == MachineOp.FLW and instr.dst and instr.src1:
+            address = _memory_address(instr.src1)
+            return f"  flw {_fmt_op(instr.dst)}, {address}{_comment_suffix(instr)}"
+
+        if instr.op == MachineOp.FSW and instr.dst and instr.src1:
+            address = _memory_address(instr.src1)
+            return f"  fsw {_fmt_op(instr.dst)}, {address}{_comment_suffix(instr)}"
 
         # Branch/jump/call use the structured target resolved above.
         if instr.op in (MachineOp.CALL, MachineOp.J, MachineOp.JAL,
